@@ -20,6 +20,15 @@ TEST_SHMID=""
 TEST_POSIX_PATH="/dev/shm/ghostshm_test_$(date +%s)"
 ATTACH_PID=""
 
+# Find Zig
+ZIG_BIN="zig"
+if ! command -v zig &> /dev/null; then
+    ZIG_CANDIDATE=$(find "$PROJECT_ROOT/tools" -name zig -type f -executable | head -n 1)
+    if [ -n "$ZIG_CANDIDATE" ]; then
+        ZIG_BIN="$ZIG_CANDIDATE"
+    fi
+fi
+
 cleanup() {
     echo "Cleaning up..."
     if [ -n "$ATTACH_PID" ]; then
@@ -37,10 +46,8 @@ trap cleanup EXIT
 
 echo "--- Building prerequisites ---"
 cc "$SYSV_ATTACH_SRC" -o "$SYSV_ATTACH_BIN"
-if [ ! -f "$BIN" ]; then
-    echo "Building ghostshm..."
-    zig build
-fi
+echo "Rebuilding ghostshm for native architecture..."
+$ZIG_BIN build
 
 echo "--- Setting up test objects ---"
 # 1. Create a SysV segment (likely orphan)
