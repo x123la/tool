@@ -125,7 +125,7 @@ pub fn parse_sysv_shm(allocator: std.mem.Allocator, path: []const u8) !std.Array
         item.shmid = try std.fmt.parseInt(i32, try get(fields.items, &col_map, "shmid"), 10);
         
         const key_str = try get(fields.items, &col_map, "key");
-        item.key = try std.fmt.parseInt(u64, key_str, 0);
+        item.key = @bitCast(try std.fmt.parseInt(i64, key_str, 0));
 
         item.bytes = try std.fmt.parseInt(u64, try get(fields.items, &col_map, "bytes"), 10);
         item.nattch = try std.fmt.parseInt(u32, try get(fields.items, &col_map, "nattch"), 10);
