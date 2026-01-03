@@ -7,7 +7,8 @@ ghostshm is a Linux CLI utility for detecting and safely reaping orphaned shared
 Safety is a primary design goal. `ghostshm` follows a conservative approach:
 - **Dry-run by default**: Commands never delete data unless `--apply` is explicitly provided.
 - **Verification**: Before any deletion, the tool re-validates the segment state (e.g., using `shmctl(IPC_STAT)` or `stat()`) to ensure no process attached between the scan and the reap.
-- **Conservative Classification**: If the tool cannot fully scan `/proc` (e.g., due to permissions), it marks ambiguous items as `unknown` and refuses to reap them automatically.
+- **Conservative Classification**: If the tool cannot fully scan `/proc` (e.g., due to permissions), it marks ambiguous items as `unknown`.
+- **Private File Override**: For POSIX shared memory, if the user owns the file and it has private permissions (`0600`), the tool allows reaping even if `/proc` visibility is partial (as other users couldn't attach anyway).
 - **Interactive Safeguard**: Even with `--apply`, users must type `DELETE` to confirm unless `--yes` is used.
 - **PID Reuse Protection**: Compares segment creation time against PID start times to avoid misidentifying recycled PIDs.
 
@@ -31,10 +32,11 @@ ghostshm reap --apply --yes
 ### Common Flags
 - `--threshold <dur>`: Minimum age of segment (e.g., `30m`, `1h`, `0s`). Default: `30m`.
 - `--min-bytes <n>`: Ignore segments smaller than this. Default: `64KB`.
-- `--allow-owner <uid>`: Whitelist a specific user.
-- `--allow-name <substring>`: Whitelist POSIX paths containing substring.
-- `--allow-key <hex/dec>`: Whitelist specific SysV key.
+- `--allow-owner <uid>`: Allowlist a specific user.
+- `--allow-name <substring>`: Allowlist POSIX paths containing substring.
+- `--allow-key <hex/dec>`: Allowlist specific SysV key.
 - `--json`: Output valid JSON for machine processing.
+- `--verbose`: Show all segments, including those smaller than min-bytes.
 
 ## Exit Codes
 
@@ -87,7 +89,7 @@ ghostshm reap --apply --yes
 
 ## Build Instructions
 
-Requires **Zig 0.13.0**.
+Requires **Zig 0.15.2**.
 
 ```bash
 zig build -Doptimize=ReleaseSafe
