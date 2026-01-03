@@ -1,0 +1,13 @@
+# Zig build artifacts
+zig-cache/
+zig-out/
+.zig-cache/
+
+# Local tools
+tools/
+sysv_test.txt
+sysv_test_header.txt
+sysv_id.txt
+
+# System files
+.DS_Store
