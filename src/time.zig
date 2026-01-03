@@ -22,7 +22,7 @@ fn get_boot_time() !u64 {
     var buf_reader = std.io.bufferedReader(file.reader());
     var in_stream = buf_reader.reader();
 
-    var buf: [1024]u8 = undefined;
+    var buf: [65536]u8 = undefined;
     while (try in_stream.readUntilDelimiterOrEof(&buf, '\n')) |line| {
         if (std.mem.startsWith(u8, line, "btime ")) {
             var it = std.mem.splitScalar(u8, line, ' ');

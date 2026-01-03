@@ -50,7 +50,7 @@ pub fn get_cmdline(allocator: std.mem.Allocator, pid: i32) ![]u8 {
     };
     defer file.close();
 
-    const content = try file.readToEndAlloc(allocator, 1024 * 4);
+    const content = try file.readToEndAlloc(allocator, 8192);
     // Replace nulls with spaces
     for (content) |*b| {
         if (b.* == 0) b.* = ' ';

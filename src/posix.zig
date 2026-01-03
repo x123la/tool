@@ -26,12 +26,17 @@ pub const PosixItem = struct {
     reclaimable_bytes: u64 = 0,
     reasons: std.ArrayList([]const u8),
 
+
+
+    allocated_strings: std.ArrayList([]u8),
+
     pub fn init(allocator: std.mem.Allocator) PosixItem {
         return PosixItem{
             .path = undefined,
             .inode = 0, .dev = 0, .bytes = 0, .uid = 0, .mtime = 0, .ctime = 0,
             .open_pids = std.ArrayList(i32).init(allocator),
             .reasons = std.ArrayList([]const u8).init(allocator),
+            .allocated_strings = std.ArrayList([]u8).init(allocator),
         };
     }
 
@@ -39,6 +44,8 @@ pub const PosixItem = struct {
         allocator.free(self.path);
         self.open_pids.deinit();
         self.reasons.deinit();
+        for (self.allocated_strings.items) |s| allocator.free(s);
+        self.allocated_strings.deinit();
     }
 };
 
@@ -95,7 +102,7 @@ pub fn correlate_open_fds(allocator: std.mem.Allocator, items: []PosixItem) !boo
         try map.put(Key{ .dev = item.dev, .ino = item.inode }, i);
     }
 
-    var proc_dir = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch return false;
+    var proc_dir = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch return true; // Failure to open /proc means partial error
     defer proc_dir.close();
 
     var it = proc_dir.iterate();
@@ -231,6 +238,19 @@ pub fn classify_item(item: *PosixItem, cfg: config_mod.Config, current_time: u64
             item.reclaimable_bytes = 0;
         }
     }
+}
+
+
+// Redefine verify_item to take allocator
+pub fn verify_item_alloc(allocator: std.mem.Allocator, item: *PosixItem) !void {
+     const path_z = try allocator.dupeZ(u8, item.path);
+     defer allocator.free(path_z);
+     
+     var st: std.c.Stat = undefined;
+     if (std.c.stat(path_z, &st) != 0) return error.StatFailed;
+     
+     if (st.dev != item.dev) return error.IdentityMismatch;
+     if (st.ino != item.inode) return error.IdentityMismatch;
 }
 
 // Tests

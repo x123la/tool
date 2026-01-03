@@ -1,7 +1,5 @@
 const std = @import("std");
-const config_mod = @import("config.zig");
-const time_mod = @import("time.zig");
-const proc_mod = @import("proc.zig"); // Need for accessing proc logic if needed? 
+const config_mod = @import("config.zig"); 
 // Ideally tests shouldn't depend on unimported modules, but integration tests do.
 // We can assume proc_mod is available to the package.
 // But we are in `sysv.zig`. We don't import `proc.zig` currently.
@@ -44,16 +42,20 @@ pub const SysVItem = struct {
     recommendation: Recommendation = .keep,
     reclaimable_bytes: u64 = 0,
     reasons: std.ArrayList([]const u8),
+    allocated_strings: std.ArrayList([]u8),
 
     pub fn init(allocator: std.mem.Allocator) SysVItem {
         return SysVItem{
             .shmid = 0, .key = 0, .bytes = 0, .nattch = 0, .uid = 0, .perms = 0, .cpid = 0, .lpid = 0, .ctime = 0,
             .reasons = std.ArrayList([]const u8).init(allocator),
+            .allocated_strings = std.ArrayList([]u8).init(allocator),
         };
     }
 
     pub fn deinit(self: *SysVItem) void {
         self.reasons.deinit();
+        for (self.allocated_strings.items) |s| self.allocated_strings.allocator.free(s);
+        self.allocated_strings.deinit();
     }
 };
 
@@ -68,8 +70,7 @@ pub fn parse_sysv_shm(allocator: std.mem.Allocator, path: []const u8) !std.Array
     const file = try std.fs.openFileAbsolute(path, .{});
     defer file.close();
 
-    var buf_reader = std.io.bufferedReader(file.reader());
-    var in_stream = buf_reader.reader();
+
 
     var items = std.ArrayList(SysVItem).init(allocator);
     errdefer { // cleanup on error
@@ -77,9 +78,12 @@ pub fn parse_sysv_shm(allocator: std.mem.Allocator, path: []const u8) !std.Array
         items.deinit();
     }
 
-    // Read header (max line length assumption suitable for proc)
-    var buf: [4096]u8 = undefined;
-    const header_line = (try in_stream.readUntilDelimiterOrEof(&buf, '\n')) orelse return ParserError.HeaderMissing;
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(content);
+
+    var lines = std.mem.tokenizeScalar(u8, content, '\n');
+
+    const header_line = lines.next() orelse return ParserError.HeaderMissing;
 
     // Map columns
     var col_map = std.StringHashMap(usize).init(allocator);
@@ -101,7 +105,7 @@ pub fn parse_sysv_shm(allocator: std.mem.Allocator, path: []const u8) !std.Array
         }
     }
 
-    while (try in_stream.readUntilDelimiterOrEof(&buf, '\n')) |line| {
+    while (lines.next()) |line| {
         if (line.len == 0) continue;
         
         var fields = std.ArrayList([]const u8).init(allocator);
@@ -115,26 +119,26 @@ pub fn parse_sysv_shm(allocator: std.mem.Allocator, path: []const u8) !std.Array
         var item = SysVItem.init(allocator);
         
         const get = struct {
-            fn val(f: []const []const u8, m: std.StringHashMap(usize), k: []const u8) ![]const u8 {
+            fn val(f: []const []const u8, m: *const std.StringHashMap(usize), k: []const u8) ![]const u8 {
                 const i = m.get(k) orelse return ParserError.MissingRequiredColumn;
                 if (i >= f.len) return ParserError.ParseError;
                 return f[i];
             }
         }.val;
 
-        item.shmid = try std.fmt.parseInt(i32, try get(fields.items, col_map, "shmid"), 10);
+        item.shmid = try std.fmt.parseInt(i32, try get(fields.items, &col_map, "shmid"), 10);
         
-        const key_str = try get(fields.items, col_map, "key");
+        const key_str = try get(fields.items, &col_map, "key");
         item.key = try std.fmt.parseInt(u64, key_str, 0);
 
-        item.bytes = try std.fmt.parseInt(u64, try get(fields.items, col_map, "bytes"), 10);
-        item.nattch = try std.fmt.parseInt(u32, try get(fields.items, col_map, "nattch"), 10);
-        item.uid = try std.fmt.parseInt(u32, try get(fields.items, col_map, "uid"), 10);
-        item.cpid = try std.fmt.parseInt(i32, try get(fields.items, col_map, "cpid"), 10);
-        item.lpid = try std.fmt.parseInt(i32, try get(fields.items, col_map, "lpid"), 10);
-        item.ctime = try std.fmt.parseInt(u64, try get(fields.items, col_map, "ctime"), 10);
+        item.bytes = try std.fmt.parseInt(u64, try get(fields.items, &col_map, "bytes"), 10);
+        item.nattch = try std.fmt.parseInt(u32, try get(fields.items, &col_map, "nattch"), 10);
+        item.uid = try std.fmt.parseInt(u32, try get(fields.items, &col_map, "uid"), 10);
+        item.cpid = try std.fmt.parseInt(i32, try get(fields.items, &col_map, "cpid"), 10);
+        item.lpid = try std.fmt.parseInt(i32, try get(fields.items, &col_map, "lpid"), 10);
+        item.ctime = try std.fmt.parseInt(u64, try get(fields.items, &col_map, "ctime"), 10);
 
-        const perms_str = try get(fields.items, col_map, "perms");
+        const perms_str = try get(fields.items, &col_map, "perms");
         var is_octal = true;
         for (perms_str) |c| {
             if (c < '0' or c > '7') {
@@ -154,7 +158,7 @@ pub fn parse_sysv_shm(allocator: std.mem.Allocator, path: []const u8) !std.Array
     return items;
 }
 
-pub fn classify_item(item: *SysVItem, cfg: config_mod.Config, current_time: u64, allocator: std.mem.Allocator) !void {
+pub fn classify_item(item: *SysVItem, cfg: config_mod.Config, current_time: u64, partial_proc_access: bool, allocator: std.mem.Allocator) !void {
     _ = allocator;
     // 1. Allowlist
     var allowlisted = false;
@@ -218,9 +222,18 @@ pub fn classify_item(item: *SysVItem, cfg: config_mod.Config, current_time: u64,
     if (item.ctime != 0 and item.age_seconds >= cfg.threshold_seconds) {
         try item.reasons.append("OLDER_THAN_THRESHOLD");
         if (!creator_effective and !last_effective) {
-            item.classification = .likely_orphan;
-            item.recommendation = .reap;
-            item.reclaimable_bytes = item.bytes;
+            if (partial_proc_access) {
+                // If we couldn't verify liveness due to permission, be conservative.
+                item.classification = .unknown; // Or possible?
+                // "unknown never upgrades to likely_orphan"
+                // "mark as unknown due to permission, not dead"
+                item.recommendation = .review;
+                try item.reasons.append("PROC_ACCESS_DENIED");
+            } else {
+                item.classification = .likely_orphan;
+                item.recommendation = .reap;
+                item.reclaimable_bytes = item.bytes;
+            }
         } else if (!creator_effective or !last_effective) {
             item.classification = .possible_orphan;
             item.recommendation = .review;
@@ -250,6 +263,99 @@ extern "c" fn shmget(key: c_int, size: usize, shmflg: c_int) c_int;
 extern "c" fn shmat(shmid: c_int, shmaddr: ?*anyopaque, shmflg: c_int) ?*anyopaque;
 extern "c" fn shmdt(shmaddr: ?*anyopaque) c_int;
 extern "c" fn shmctl(shmid: c_int, cmd: c_int, buf: ?*anyopaque) c_int;
+
+const IPC_STAT = 2;
+
+// Partial shmid_ds definition for verification
+const shmid_ds = extern struct {
+    shm_perm: extern struct {
+        uid: u32,
+        gid: u32,
+        cuid: u32,
+        cgid: u32,
+        mode: u32,
+        _seq: u32, // pad or seq
+        __key: i32, 
+        // Layout depends on arch (x86_64). 
+        // Using explicit padding might be safer or using libc headers if available.
+        // Zig translates C headers if allowed.
+        // Let's assume standard linux x86_64 layout or close enough for checking size/ctime?
+        // Actually, struct layout varies. Using raw bytes or strict definition is hard without verify.
+        // Better to check `bytes` (shm_segsz) and `ctime` (shm_ctime).
+    },
+    shm_segsz: usize,
+    shm_atime: c_long,
+    shm_dtime: c_long,
+    shm_ctime: c_long,
+    shm_cpid: i32,
+    shm_lpid: i32,
+    shm_nattch: usize,
+    // plus more padding
+};
+
+// We can try to use a simplified check or `shmctl` behavior.
+// If we can't reliably define shmid_ds without importing a C header, we risk reading garbage.
+// But we can limit our check to simple fields if we are careful.
+// Or we can rely on `scan`'s view being "good enough" if we accept some risk, 
+// BUT input says "Add re-validation... safety critical".
+// So we MUST try.
+// Standard `shmid_ds` on Linux x86_64?
+// Let's define a wrapper that roughly matches.
+// Actually, `man shmctl` says `struct shmid_ds`.
+// `shm_perm` is `struct ipc_perm`.
+// `ipc_perm` is key(4), uid(4), gid(4), cuid(4), cgid(4), mode(4), seq(4)? No.
+// Safe approach: Define enough space and use offsets? No.
+// Let's use `extern struct` matching standard clib.
+
+const ipc_perm = extern struct {
+    __key: i32,
+    uid: u32,
+    gid: u32,
+    cuid: u32,
+    cgid: u32,
+    mode: u16,
+    __pad1: u16,
+    __seq: u16,
+    __pad2: u16,
+    __unused1: c_ulong,
+    __unused2: c_ulong,
+};
+
+const shmid_ds_linux = extern struct {
+    shm_perm: ipc_perm,
+    shm_segsz: usize,
+    shm_atime: c_long,
+    shm_dtime: c_long,
+    shm_ctime: c_long,
+    shm_cpid: i32,
+    shm_lpid: i32,
+    shm_nattch: usize,
+    __unused4: c_ulong,
+    __unused5: c_ulong,
+};
+
+pub fn verify_item(item: *SysVItem) !void {
+    var ds: shmid_ds_linux = undefined;
+    if (shmctl(@intCast(item.shmid), IPC_STAT, &ds) != 0) {
+        return error.VerificationFailed;
+    }
+    
+    // Check consistency
+    // Note: ctime is stable? yes, set on creation or ipc_set.
+    // bytes should match.
+    // nattch should match 0 (orphan) if we think it's orphan?
+    // User request: "ds.shm_nattch == 0 still holds (must be zero at delete time)"
+    
+    // Check size
+    if (ds.shm_segsz != item.bytes) return error.SizeMismatch;
+    
+    // Check ctime
+    if (@as(u64, @intCast(ds.shm_ctime)) != item.ctime) return error.CtimeMismatch;
+    
+    // Check nattch
+    // If we are reaping, it SHOULD be 0.
+    if (ds.shm_nattch > 0) return error.Attached;
+}
 
 test "sysv header parsing" {
     const allocator = std.testing.allocator;
@@ -342,7 +448,7 @@ test "integration sysv orphan detection" {
                  item.creator_alive = false;
                  item.last_alive = false;
                  
-                 try classify_item(item, cfg, @intCast(std.time.timestamp()), allocator);
+                 try classify_item(item, cfg, @intCast(std.time.timestamp()), false, allocator);
                  
                  try std.testing.expectEqual(item.classification, .likely_orphan);
                  found = true;

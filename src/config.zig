@@ -35,6 +35,7 @@ pub const Config = struct {
     yes: bool = false,
     force: bool = false,
 
+    allocated_strings: std.ArrayList([]u8),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Config {
@@ -43,6 +44,7 @@ pub const Config = struct {
             .allow_owners = std.ArrayList(u32).init(allocator),
             .allow_names = std.ArrayList([]const u8).init(allocator),
             .allow_keys = std.ArrayList(u64).init(allocator),
+            .allocated_strings = std.ArrayList([]u8).init(allocator),
             .allocator = allocator,
         };
     }
@@ -51,6 +53,8 @@ pub const Config = struct {
         self.allow_owners.deinit();
         self.allow_names.deinit();
         self.allow_keys.deinit();
+        for (self.allocated_strings.items) |s| self.allocator.free(s);
+        self.allocated_strings.deinit();
     }
 };
 
@@ -63,7 +67,7 @@ pub fn parse_args(allocator: std.mem.Allocator) !Config {
     var config = Config.init(allocator);
 
     // Initial pass to determine command
-    var command_set = false;
+    // var command_set = false;
     
     // We need to collect args to process flags. 
     // Since zig args iterator is forward only, we process strictly.
@@ -86,7 +90,9 @@ pub fn parse_args(allocator: std.mem.Allocator) !Config {
     defer arg_list.deinit();
     
     while (args.next()) |arg| {
-        try arg_list.append(try allocator.dupe(u8, arg));
+        const s = try allocator.dupe(u8, arg);
+        try config.allocated_strings.append(s);
+        try arg_list.append(s);
     }
 
     // Determine command
@@ -96,15 +102,15 @@ pub fn parse_args(allocator: std.mem.Allocator) !Config {
         if (!std.mem.startsWith(u8, first, "-")) {
             if (std.mem.eql(u8, first, "scan")) {
                 config.mode = .scan;
-                command_set = true;
+                // command_set = true;
                 arg_idx += 1;
             } else if (std.mem.eql(u8, first, "reap")) {
                 config.mode = .reap;
-                command_set = true;
+                // command_set = true;
                 arg_idx += 1;
             } else if (std.mem.eql(u8, first, "explain")) {
                 config.mode = .explain;
-                command_set = true;
+                // command_set = true;
                 arg_idx += 1;
                 // Next arg MUST be ID
                 if (arg_idx < arg_list.items.len) {
