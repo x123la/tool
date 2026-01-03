@@ -19,11 +19,11 @@ fn get_boot_time() !u64 {
     const file = try std.fs.openFileAbsolute("/proc/stat", .{});
     defer file.close();
 
-    var buf_reader = std.io.bufferedReader(file.reader());
-    var in_stream = buf_reader.reader();
-
     var buf: [65536]u8 = undefined;
-    while (try in_stream.readUntilDelimiterOrEof(&buf, '\n')) |line| {
+    const n = try file.readAll(&buf);
+    var lines = std.mem.tokenizeScalar(u8, buf[0..n], '\n');
+
+    while (lines.next()) |line| {
         if (std.mem.startsWith(u8, line, "btime ")) {
             var it = std.mem.splitScalar(u8, line, ' ');
             _ = it.next(); // skip "btime"

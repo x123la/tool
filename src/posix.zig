@@ -14,7 +14,7 @@ pub const PosixItem = struct {
     ctime: u64,
 
     // Open handles
-    open_pids: std.ArrayList(i32),
+    open_pids: std.array_list.Managed(i32),
     open_pids_count: u32 = 0,
 
     // Derived
@@ -24,7 +24,7 @@ pub const PosixItem = struct {
     classification: Classification = .unknown,
     recommendation: Recommendation = .keep,
     reclaimable_bytes: u64 = 0,
-    reasons: std.ArrayList([]const u8),
+    reasons: std.array_list.Managed([]const u8),
 
 
 
@@ -34,8 +34,8 @@ pub const PosixItem = struct {
         return PosixItem{
             .path = undefined,
             .inode = 0, .dev = 0, .bytes = 0, .uid = 0, .mtime = 0, .ctime = 0,
-            .open_pids = std.ArrayList(i32).init(allocator),
-            .reasons = std.ArrayList([]const u8).init(allocator),
+            .open_pids = std.array_list.Managed(i32).init(allocator),
+            .reasons = std.array_list.Managed([]const u8).init(allocator),
         };
     }
 
@@ -46,8 +46,8 @@ pub const PosixItem = struct {
     }
 };
 
-pub fn scan_posix_dir(allocator: std.mem.Allocator, dir_path: []const u8) !std.ArrayList(PosixItem) {
-    var items = std.ArrayList(PosixItem).init(allocator);
+pub fn scan_posix_dir(allocator: std.mem.Allocator, dir_path: []const u8) !std.array_list.Managed(PosixItem) {
+    var items = std.array_list.Managed(PosixItem).init(allocator);
     errdefer {
         for (items.items) |*item| item.deinit(allocator);
         items.deinit();
@@ -66,21 +66,17 @@ pub fn scan_posix_dir(allocator: std.mem.Allocator, dir_path: []const u8) !std.A
         item.path = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, entry.name });
         
         // stat
-        var st: std.c.Stat = undefined;
-        const path_z = try allocator.dupeZ(u8, item.path);
-        defer allocator.free(path_z);
-        
-        if (std.c.stat(path_z, &st) != 0) {
+        const st = std.posix.fstatat(std.posix.AT.FDCWD, item.path, 0) catch {
             item.deinit(allocator);
             continue;
-        }
+        };
         
         item.dev = st.dev;
         item.inode = st.ino;
         item.bytes = @intCast(st.size);
         item.uid = st.uid;
-        item.mtime = @intCast(st.mtim.tv_sec);
-        item.ctime = @intCast(st.ctim.tv_sec);
+        item.mtime = @intCast(st.mtim.sec);
+        item.ctime = @intCast(st.ctim.sec);
 
         try items.append(item);
     }
@@ -122,11 +118,7 @@ pub fn correlate_open_fds(allocator: std.mem.Allocator, items: []PosixItem) !boo
         while (try fd_it.next()) |fd_entry| {
              var fd_path_buf: [128]u8 = undefined;
              const fd_path = std.fmt.bufPrint(&fd_path_buf, "/proc/{d}/fd/{s}", .{pid, fd_entry.name}) catch continue;
-             const fd_path_z = try allocator.dupeZ(u8, fd_path);
-             defer allocator.free(fd_path_z);
-             
-             var st: std.c.Stat = undefined;
-             if (std.c.stat(fd_path_z, &st) != 0) continue;
+             const st = std.posix.fstatat(std.posix.AT.FDCWD, fd_path, 0) catch continue;
              
              const k = Key{ .dev = st.dev, .ino = st.ino };
              if (map.get(k)) |idx| {
@@ -240,11 +232,8 @@ pub fn classify_item(item: *PosixItem, cfg: config_mod.Config, current_time: u64
 
 // Redefine verify_item to take allocator
 pub fn verify_item_alloc(allocator: std.mem.Allocator, item: *PosixItem) !void {
-     const path_z = try allocator.dupeZ(u8, item.path);
-     defer allocator.free(path_z);
-     
-     var st: std.c.Stat = undefined;
-     if (std.c.stat(path_z, &st) != 0) return error.StatFailed;
+     _ = allocator;
+     const st = try std.posix.fstatat(std.posix.AT.FDCWD, item.path, 0);
      
      if (st.dev != item.dev) return error.IdentityMismatch;
      if (st.ino != item.inode) return error.IdentityMismatch;
@@ -267,7 +256,7 @@ test "integration posix open-handle" {
     
     // Create large file > min_bytes default (65536)
     const file = try std.fs.createFileAbsolute(file_path, .{});
-    try file.writer().writeByteNTimes('a', 70000);
+    try file.deprecatedWriter().writeByteNTimes('a', 70000);
     file.close();
 
     const pid = try std.posix.fork();
@@ -275,12 +264,12 @@ test "integration posix open-handle" {
         // Child: Open file, sleep
         const f = std.fs.openFileAbsolute(file_path, .{}) catch std.posix.exit(1);
         _ = f; // keep handle open
-        std.time.sleep(2 * std.time.ns_per_s);
+        std.Thread.sleep(2 * std.time.ns_per_s);
         std.posix.exit(0);
     } else {
         // Parent
         // Wait 0.5s for child to open
-        std.time.sleep(500 * std.time.ns_per_ms);
+        std.Thread.sleep(500 * std.time.ns_per_ms);
         
         // Scan 1: Assert In Use
         var items = try scan_posix_dir(allocator, tmp_path);

@@ -41,12 +41,12 @@ pub const SysVItem = struct {
     classification: Classification = .unknown,
     recommendation: Recommendation = .keep,
     reclaimable_bytes: u64 = 0,
-    reasons: std.ArrayList([]const u8),
+    reasons: std.array_list.Managed([]const u8),
 
     pub fn init(allocator: std.mem.Allocator) SysVItem {
         return SysVItem{
             .shmid = 0, .key = 0, .bytes = 0, .nattch = 0, .uid = 0, .perms = 0, .cpid = 0, .lpid = 0, .ctime = 0,
-            .reasons = std.ArrayList([]const u8).init(allocator),
+            .reasons = std.array_list.Managed([]const u8).init(allocator),
         };
     }
 
@@ -62,13 +62,13 @@ pub const ParserError = error{
     FileReadError,
 };
 
-pub fn parse_sysv_shm(allocator: std.mem.Allocator, path: []const u8) !std.ArrayList(SysVItem) {
+pub fn parse_sysv_shm(allocator: std.mem.Allocator, path: []const u8) !std.array_list.Managed(SysVItem) {
     const file = try std.fs.openFileAbsolute(path, .{});
     defer file.close();
 
 
 
-    var items = std.ArrayList(SysVItem).init(allocator);
+    var items = std.array_list.Managed(SysVItem).init(allocator);
     errdefer { // cleanup on error
         for (items.items) |*item| item.deinit();
         items.deinit();
@@ -104,7 +104,7 @@ pub fn parse_sysv_shm(allocator: std.mem.Allocator, path: []const u8) !std.Array
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         
-        var fields = std.ArrayList([]const u8).init(allocator);
+        var fields = std.array_list.Managed([]const u8).init(allocator);
         defer fields.deinit();
         
         var lit = std.mem.tokenizeAny(u8, line, " \t");
@@ -320,10 +320,11 @@ test "integration sysv orphan detection" {
         if (@intFromPtr(ptr) == @as(usize, @bitCast(@as(isize, -1)))) std.posix.exit(2);
         _ = c.shmdt(ptr);
         
-        const file = std.fs.cwd().createFile("sysv_id.txt", .{}) catch std.posix.exit(3);
-        const writer = file.writer();
+        const path = "sysv_id.txt";
+        const file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+        const writer = file.deprecatedWriter();
         writer.print("{d}", .{id}) catch std.posix.exit(4);
-        file.close();
 
         std.posix.exit(0);
     } else {

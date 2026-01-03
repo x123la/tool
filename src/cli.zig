@@ -28,32 +28,32 @@ pub fn run(allocator: std.mem.Allocator) !u8 {
 }
 
 fn run_scan(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time_mod.SystemTime, now: u64) !u8 {
-    var sysv_items: std.ArrayList(sysv_mod.SysVItem) = undefined;
+    var sysv_items: std.array_list.Managed(sysv_mod.SysVItem) = undefined;
     if (cfg.target_type == .sysv or cfg.target_type == .both) {
         sysv_items = try sysv_mod.parse_sysv_shm(allocator, "/proc/sysvipc/shm");
     } else {
-        sysv_items = std.ArrayList(sysv_mod.SysVItem).init(allocator);
+        sysv_items = std.array_list.Managed(sysv_mod.SysVItem).init(allocator);
     }
     defer {
         for (sysv_items.items) |*i| i.deinit();
         sysv_items.deinit();
     }
     
-    var posix_items: std.ArrayList(posix_mod.PosixItem) = undefined;
+    var posix_items: std.array_list.Managed(posix_mod.PosixItem) = undefined;
     var partial_proc_access_posix = false;
     
     if (cfg.target_type == .posix or cfg.target_type == .both) {
         posix_items = try posix_mod.scan_posix_dir(allocator, cfg.posix_dir);
         partial_proc_access_posix = try posix_mod.correlate_open_fds(allocator, posix_items.items);
     } else {
-        posix_items = std.ArrayList(posix_mod.PosixItem).init(allocator);
+        posix_items = std.array_list.Managed(posix_mod.PosixItem).init(allocator);
     }
     defer {
         for (posix_items.items) |*i| i.deinit(allocator);
         posix_items.deinit();
     }
     
-    var items = std.ArrayList(output_mod.Item).init(allocator);
+    var items = std.array_list.Managed(output_mod.Item).init(allocator);
     defer items.deinit(); // pointers only, safe
     
     var partial_proc_access_sysv = false;
@@ -147,24 +147,24 @@ fn run_scan(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
 }
 
 fn run_explain(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time_mod.SystemTime, now: u64) !u8 {
-    var sysv_items: std.ArrayList(sysv_mod.SysVItem) = undefined;
+    var sysv_items: std.array_list.Managed(sysv_mod.SysVItem) = undefined;
     if (cfg.target_type == .sysv or cfg.target_type == .both) {
         sysv_items = try sysv_mod.parse_sysv_shm(allocator, "/proc/sysvipc/shm");
     } else {
-        sysv_items = std.ArrayList(sysv_mod.SysVItem).init(allocator);
+        sysv_items = std.array_list.Managed(sysv_mod.SysVItem).init(allocator);
     }
     defer {
         for (sysv_items.items) |*i| i.deinit();
         sysv_items.deinit();
     }
     
-    var posix_items: std.ArrayList(posix_mod.PosixItem) = undefined;
+    var posix_items: std.array_list.Managed(posix_mod.PosixItem) = undefined;
     var partial_proc_access_posix = false;
     if (cfg.target_type == .posix or cfg.target_type == .both) {
         posix_items = try posix_mod.scan_posix_dir(allocator, cfg.posix_dir);
         partial_proc_access_posix = try posix_mod.correlate_open_fds(allocator, posix_items.items);
     } else {
-        posix_items = std.ArrayList(posix_mod.PosixItem).init(allocator);
+        posix_items = std.array_list.Managed(posix_mod.PosixItem).init(allocator);
     }
     defer {
         for (posix_items.items) |*i| i.deinit(allocator);
@@ -243,76 +243,92 @@ fn run_explain(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: t
     }
 
     if (cfg.json) {
-        const stdout = std.io.getStdOut().writer();
-        // Use JSON writer for explain output too? 
-        // User asked "At minimum fix reap... If explain --json also exists, convert it too."
-        var ws = std.json.writeStream(stdout, .{});
-        try ws.beginObject();
-        try ws.objectField("found"); try ws.write(found_item != null);
-        
-        if (found_item) |it| {
-             switch (it) {
-                .sysv => |s| {
-                    try ws.objectField("sysv");
-                    try ws.beginObject();
-                    try ws.objectField("shmid"); try ws.write(s.shmid);
-                    try ws.objectField("bytes"); try ws.write(s.bytes);
-                    try ws.objectField("classification"); try ws.write(@tagName(s.classification));
-                    try ws.objectField("recommendation"); try ws.write(@tagName(s.recommendation));
-                    try ws.objectField("reasons");
-                    try ws.beginArray();
-                    for (s.reasons.items) |r| try ws.write(r);
-                    try ws.endArray();
-                    try ws.endObject();
-                },
-                .posix => |p| {
-                     try ws.objectField("posix");
-                     try ws.beginObject();
-                     try ws.objectField("path"); try ws.write(p.path);
-                     try ws.objectField("bytes"); try ws.write(p.bytes);
-                     try ws.objectField("classification"); try ws.write(@tagName(p.classification));
-                     try ws.objectField("recommendation"); try ws.write(@tagName(p.recommendation));
-                     try ws.objectField("reasons");
-                     try ws.beginArray();
-                     for (p.reasons.items) |r| try ws.write(r);
-                     try ws.endArray();
-                     try ws.endObject();
-                }
-             }
-        }
-        try ws.endObject();
-    } else {
-        const stdout = std.io.getStdOut().writer();
+        const stdout_file = std.fs.File.stdout();
+        var writer = stdout_file.deprecatedWriter();
+
+        // Schema for Explain
+        const JsonExplain = struct {
+            found: bool,
+            sysv: ?struct {
+                shmid: i32,
+                bytes: u64,
+                classification: []const u8,
+                recommendation: []const u8,
+                reasons: []const []const u8,
+            } = null,
+            posix: ?struct {
+                path: []const u8,
+                bytes: u64,
+                classification: []const u8,
+                recommendation: []const u8,
+                reasons: []const []const u8,
+            } = null,
+        };
+
+        var out_obj = JsonExplain{ .found = (found_item != null) };
+
         if (found_item) |it| {
             switch (it) {
                 .sysv => |s| {
-                    try stdout.print("EXPLAIN TYPE=sysv ID={d}\n", .{s.shmid});
-                    try stdout.print("  key: 0x{x:0>8}\n", .{s.key});
-                    try stdout.print("  bytes: {d}\n  age: {d}s\n  nattch: {d}\n", .{s.bytes, s.age_seconds, s.nattch});
-                    try stdout.print("  uid: {d}\n  perms: 0o{o}\n", .{s.uid, s.perms});
-                    try stdout.print("  creator_pid: {d} (alive: {}, reused: {})\n", .{s.cpid, s.creator_alive, s.creator_pid_reused});
-                    try stdout.print("  last_pid: {d} (alive: {}, reused: {})\n", .{s.lpid, s.last_alive, s.last_pid_reused});
-                    try stdout.print("CLASSIFICATION: {s}\n", .{@tagName(s.classification)});
-                    for (s.reasons.items) |r| try stdout.print("- {s}\n", .{r});
+                    out_obj.sysv = .{
+                        .shmid = s.shmid,
+                        .bytes = s.bytes,
+                        .classification = output_mod.classification_str(s.classification), // output_mod made pub? Check if it is public.
+                        // Wait, output_mod functions were private? I need to check if classification_str is pub.
+                        // If not, I should duplicate logic or make it pub. 
+                        // Assuming I will make them pub in output.zig or they are already usable if I import correctly.
+                        // Actually, they are private in output.zig (fn classification_str).
+                        // I will make them pub in a separate edit or duplicate strings here for safety now.
+                        .recommendation = @tagName(s.recommendation),
+                        .reasons = s.reasons.items,
+                    };
                 },
                 .posix => |p| {
-                    try stdout.print("EXPLAIN TYPE=posix ID={s}\n", .{p.path});
-                    try stdout.print("  bytes: {d}\n  age: {d}s\n", .{p.bytes, p.age_seconds});
-                    try stdout.print("  uid: {d}\n", .{p.uid});
-                    try stdout.print("  open_pids_count: {d}\n", .{p.open_pids_count});
+                     out_obj.posix = .{
+                         .path = p.path,
+                         .bytes = p.bytes,
+                         .classification = @tagName(p.classification),
+                         .recommendation = @tagName(p.recommendation),
+                         .reasons = p.reasons.items,
+                     };
+                }
+            }
+        }
+        try writer.print("{f}", .{std.json.fmt(out_obj, .{})});
+
+    } else {
+        const stdout_file = std.fs.File.stdout();
+        var writer = stdout_file.deprecatedWriter();
+        if (found_item) |it| {
+            switch (it) {
+                .sysv => |s| {
+                    try writer.print("EXPLAIN TYPE=sysv ID={d}\n", .{s.shmid});
+                    try writer.print("  key: 0x{x:0>8}\n", .{s.key});
+                    try writer.print("  bytes: {d}\n  age: {d}s\n  nattch: {d}\n", .{s.bytes, s.age_seconds, s.nattch});
+                    try writer.print("  uid: {d}\n  perms: 0o{o}\n", .{s.uid, s.perms});
+                    try writer.print("  creator_pid: {d} (alive: {}, reused: {})\n", .{s.cpid, s.creator_alive, s.creator_pid_reused});
+                    try writer.print("  last_pid: {d} (alive: {}, reused: {})\n", .{s.lpid, s.last_alive, s.last_pid_reused});
+                    try writer.print("CLASSIFICATION: {s}\n", .{@tagName(s.classification)});
+                    for (s.reasons.items) |r| try writer.print("- {s}\n", .{r});
+                },
+                .posix => |p| {
+                    try writer.print("EXPLAIN TYPE=posix ID={s}\n", .{p.path});
+                    try writer.print("  bytes: {d}\n  age: {d}s\n", .{p.bytes, p.age_seconds});
+                    try writer.print("  uid: {d}\n", .{p.uid});
+                    try writer.print("  open_pids_count: {d}\n", .{p.open_pids_count});
                     if (p.open_pids_count > 0) {
-                        try stdout.print("  open_pids: ", .{});
+                        try writer.print("  open_pids: ", .{});
                         for (p.open_pids.items, 0..) |pid, i| {
-                            try stdout.print("{d}{s}", .{pid, if (i < p.open_pids.items.len - 1) ", " else ""});
+                            try writer.print("{d}{s}", .{pid, if (i < p.open_pids.items.len - 1) ", " else ""});
                         }
-                        try stdout.print("\n", .{});
+                        try writer.print("\n", .{});
                     }
-                    try stdout.print("CLASSIFICATION: {s}\n", .{@tagName(p.classification)});
-                    for (p.reasons.items) |r| try stdout.print("- {s}\n", .{r});
+                    try writer.print("CLASSIFICATION: {s}\n", .{@tagName(p.classification)});
+                    for (p.reasons.items) |r| try writer.print("- {s}\n", .{r});
                 }
             }
         } else {
-            try stdout.print("Item not found.\n", .{});
+            try writer.print("Item not found.\n", .{});
         }
     }
 
@@ -321,24 +337,24 @@ fn run_explain(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: t
 }
 
 fn run_reap(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time_mod.SystemTime, now: u64) !u8 {
-    var sysv_items: std.ArrayList(sysv_mod.SysVItem) = undefined;
+    var sysv_items: std.array_list.Managed(sysv_mod.SysVItem) = undefined;
     if (cfg.target_type == .sysv or cfg.target_type == .both) {
         sysv_items = try sysv_mod.parse_sysv_shm(allocator, "/proc/sysvipc/shm");
     } else {
-        sysv_items = std.ArrayList(sysv_mod.SysVItem).init(allocator);
+        sysv_items = std.array_list.Managed(sysv_mod.SysVItem).init(allocator);
     }
     defer {
         for (sysv_items.items) |*i| i.deinit();
         sysv_items.deinit();
     }
 
-    var posix_items: std.ArrayList(posix_mod.PosixItem) = undefined;
+    var posix_items: std.array_list.Managed(posix_mod.PosixItem) = undefined;
     var partial_proc_access_posix = false;
     if (cfg.target_type == .posix or cfg.target_type == .both) {
         posix_items = try posix_mod.scan_posix_dir(allocator, cfg.posix_dir);
         partial_proc_access_posix = try posix_mod.correlate_open_fds(allocator, posix_items.items);
     } else {
-        posix_items = std.ArrayList(posix_mod.PosixItem).init(allocator);
+        posix_items = std.array_list.Managed(posix_mod.PosixItem).init(allocator);
     }
     defer {
         for (posix_items.items) |*i| i.deinit(allocator);
@@ -346,7 +362,7 @@ fn run_reap(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
     }
 
     var partial_proc_access_sysv = false;
-    var plan = std.ArrayList(output_mod.Item).init(allocator);
+    var plan = std.array_list.Managed(output_mod.Item).init(allocator);
     defer plan.deinit();
 
     // Classification & Planning
@@ -427,7 +443,7 @@ fn run_reap(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
         deleted: bool,
         error_msg: ?[]const u8,
     };
-    var results = std.ArrayList(Result).init(allocator);
+    var results = std.array_list.Managed(Result).init(allocator);
     defer {
         for (results.items) |r| if (r.error_msg) |m| allocator.free(m);
         results.deinit();
@@ -451,12 +467,23 @@ fn run_reap(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
                 return error.MissingYesForJsonApply;
             }
             if (!cfg.yes and !cfg.json) {
-                const stderr = std.io.getStdErr().writer();
+                const stderr_file = std.fs.File.stderr();
+                var stderr = stderr_file.deprecatedWriter();
                 try stderr.print("\nWARNING: You are about to DELETE {d} items totaling {d} bytes.\n", .{plan.items.len, planned_total_bytes});
                 try stderr.print("Type DELETE to confirm: ", .{});
-                const stdin = std.io.getStdIn().reader();
-                var buf: [64]u8 = undefined;
-                if (try stdin.readUntilDelimiterOrEof(&buf, '\n')) |line| {
+                const stdin_file = std.fs.File.stdin();
+                var line_buf: [64]u8 = undefined;
+                var line_len: usize = 0;
+                while (line_len < line_buf.len) {
+                    var byte_buf: [1]u8 = undefined;
+                    const n = try stdin_file.read(&byte_buf);
+                    if (n == 0) break;
+                    if (byte_buf[0] == '\n') break;
+                    line_buf[line_len] = byte_buf[0];
+                    line_len += 1;
+                }
+                if (line_len > 0) {
+                    const line = line_buf[0..line_len];
                     const trimmed = std.mem.trim(u8, line, " \r\t");
                     if (!std.mem.eql(u8, trimmed, "DELETE")) {
                          try stderr.print("Aborted.\n", .{});
@@ -519,92 +546,119 @@ fn run_reap(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
     }
 
     if (cfg.json) {
-        const stdout = std.io.getStdOut().writer();
-        var ws = std.json.writeStream(stdout, .{});
-        try ws.beginObject();
-        try ws.objectField("apply"); try ws.write(cfg.apply);
-        try ws.objectField("dry_run"); try ws.write(dry_run);
-        try ws.objectField("force"); try ws.write(cfg.force);
-        try ws.objectField("partial_proc_access_sysv"); try ws.write(partial_proc_access_sysv);
-        try ws.objectField("partial_proc_access_posix"); try ws.write(partial_proc_access_posix);
-        try ws.objectField("planned_total_bytes"); try ws.write(planned_total_bytes);
+        const stdout_file = std.fs.File.stdout();
+        var writer = stdout_file.deprecatedWriter();
+
+        const JsonReapItem = struct {
+            kind: []const u8,
+            id: ?i32 = null, // sysv only
+            path: ?[]const u8 = null, // posix only
+            bytes: u64,
+            reasons: []const []const u8,
+        };
+
+        const JsonReapResult = struct {
+            kind: []const u8,
+            id: ?i32,
+            path: ?[]const u8,
+            attempted: bool,
+            deleted: bool,
+            error_msg: ?[]const u8, // Renamed from 'error' to avoid reserved word conflict
+        };
+
+        const JsonReap = struct {
+            apply: bool,
+            dry_run: bool,
+            force: bool,
+            partial_proc_access_sysv: bool,
+            partial_proc_access_posix: bool,
+            planned_total_bytes: u64,
+            planned_deletions: []const JsonReapItem,
+            results: []const JsonReapResult,
+            deleted_count: u64,
+            failed_count: u64,
+        };
         
-        try ws.objectField("planned_deletions");
-        try ws.beginArray();
-        for (plan.items) |it| {
-            try ws.beginObject();
-            switch (it) {
-                .sysv => |s| {
-                    try ws.objectField("kind"); try ws.write("sysv");
-                    try ws.objectField("id"); try ws.write(s.shmid);
-                    try ws.objectField("path"); try ws.write(null);
-                    try ws.objectField("bytes"); try ws.write(s.bytes);
-                    try ws.objectField("reasons");
-                        try ws.beginArray();
-                        for (s.reasons.items) |r| try ws.write(r);
-                        try ws.endArray();
-                },
-                .posix => |p| {
-                    try ws.objectField("kind"); try ws.write("posix");
-                    try ws.objectField("id"); try ws.write(null);
-                    try ws.objectField("path"); try ws.write(p.path);
-                    try ws.objectField("bytes"); try ws.write(p.bytes);
-                    try ws.objectField("reasons");
-                        try ws.beginArray();
-                        for (p.reasons.items) |r| try ws.write(r);
-                        try ws.endArray();
-                }
-            }
-            try ws.endObject();
-        }
-        try ws.endArray();
-        
-        try ws.objectField("results");
-        try ws.beginArray();
-        for (results.items) |res| {
-            try ws.beginObject();
-            try ws.objectField("kind"); try ws.write(res.kind);
-            try ws.objectField("id"); try ws.write(res.id);
-            try ws.objectField("path"); try ws.write(res.path);
-            try ws.objectField("attempted"); try ws.write(res.attempted);
-            try ws.objectField("deleted"); try ws.write(res.deleted);
-            try ws.objectField("error"); 
-            if (res.error_msg) |m| try ws.write(m) else try ws.write(null);
-            try ws.endObject();
-        }
-        try ws.endArray();
-        
-        try ws.objectField("deleted_count"); try ws.write(deleted_count);
-        try ws.objectField("failed_count"); try ws.write(failed_count);
-        
-        try ws.endObject();
-    } else {
-        // Human output
-        const stdout = std.io.getStdOut().writer();
-        try stdout.print("REAP PLAN (dry_run={})\n", .{dry_run});
-        try stdout.print("TYPE   ID                                                           SIZE\n", .{});
+        var json_planned = std.array_list.Managed(JsonReapItem).init(allocator);
+        defer json_planned.deinit();
+
         for (plan.items) |it| {
              switch (it) {
-                .sysv => |s| try stdout.print("sysv   {d:<60} {d}\n", .{s.shmid, s.bytes}),
+                .sysv => |s| {
+                    try json_planned.append(.{
+                        .kind = "sysv",
+                        .id = s.shmid,
+                        .bytes = s.bytes,
+                        .reasons = s.reasons.items,
+                    });
+                },
+                .posix => |p| {
+                    try json_planned.append(.{
+                        .kind = "posix",
+                        .path = p.path,
+                        .bytes = p.bytes,
+                        .reasons = p.reasons.items,
+                    });
+                }
+            }
+        }
+
+        var json_results = std.array_list.Managed(JsonReapResult).init(allocator);
+        defer json_results.deinit();
+
+        for (results.items) |res| {
+            try json_results.append(.{
+                .kind = res.kind,
+                .id = res.id,
+                .path = res.path,
+                .attempted = res.attempted,
+                .deleted = res.deleted,
+                .error_msg = res.error_msg,
+            });
+        }
+        
+        const out_obj = JsonReap{
+            .apply = cfg.apply,
+            .dry_run = dry_run,
+            .force = cfg.force,
+            .partial_proc_access_sysv = partial_proc_access_sysv,
+            .partial_proc_access_posix = partial_proc_access_posix,
+            .planned_total_bytes = planned_total_bytes,
+            .planned_deletions = json_planned.items,
+            .results = json_results.items,
+            .deleted_count = deleted_count,
+            .failed_count = failed_count,
+        };
+
+        try writer.print("{f}", .{std.json.fmt(out_obj, .{})});
+    } else {
+        // Human output
+        const stdout_file = std.fs.File.stdout();
+        var writer = stdout_file.deprecatedWriter();
+        try writer.print("REAP PLAN (dry_run={})\n", .{dry_run});
+        try writer.print("TYPE   ID                                                           SIZE\n", .{});
+        for (plan.items) |it| {
+             switch (it) {
+                .sysv => |s| try writer.print("sysv   {d:<60} {d}\n", .{s.shmid, s.bytes}),
                 .posix => |p| {
                     const base = std.fs.path.basename(p.path);
-                    try stdout.print("posix  {s:<60} {d}\n", .{base, p.bytes});
+                    try writer.print("posix  {s:<60} {d}\n", .{base, p.bytes});
                 }
              }
         }
         if (cfg.apply) {
-             try stdout.print("\nRESULTS:\n", .{});
+             try writer.print("\nRESULTS:\n", .{});
              for (results.items) |res| {
                  const id_s = if (res.id) |i| try std.fmt.allocPrint(allocator, "{d}", .{i}) else res.path orelse "???";
                  defer if (res.id != null) allocator.free(id_s);
                  
                  if (res.deleted) {
-                     try stdout.print("DELETED {s} {s}\n", .{res.kind, id_s});
+                     try writer.print("DELETED {s} {s}\n", .{res.kind, id_s});
                  } else {
-                     try stdout.print("FAILED  {s} {s}: {s}\n", .{res.kind, id_s, res.error_msg orelse "unknown"});
+                     try writer.print("FAILED  {s} {s}: {s}\n", .{res.kind, id_s, res.error_msg orelse "unknown"});
                  }
              }
-             try stdout.print("Sum: {d} deleted, {d} failed.\n", .{deleted_count, failed_count});
+             try writer.print("Sum: {d} deleted, {d} failed.\n", .{deleted_count, failed_count});
         }
     }
     

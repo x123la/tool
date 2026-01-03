@@ -21,9 +21,9 @@ pub const Config = struct {
     threshold_seconds: u64 = 1800, // 30m
     min_bytes: u64 = 65536,
     target_type: TargetType = .both,
-    allow_owners: std.ArrayList(u32),
-    allow_names: std.ArrayList([]const u8),
-    allow_keys: std.ArrayList(u64),
+    allow_owners: std.array_list.Managed(u32),
+    allow_names: std.array_list.Managed([]const u8),
+    allow_keys: std.array_list.Managed(u64),
     no_color: bool = false,
     verbose: bool = false,
 
@@ -35,16 +35,16 @@ pub const Config = struct {
     yes: bool = false,
     force: bool = false,
 
-    allocated_strings: std.ArrayList([]u8),
+    allocated_strings: std.array_list.Managed([]u8),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Config {
         return Config{
             .mode = .scan,
-            .allow_owners = std.ArrayList(u32).init(allocator),
-            .allow_names = std.ArrayList([]const u8).init(allocator),
-            .allow_keys = std.ArrayList(u64).init(allocator),
-            .allocated_strings = std.ArrayList([]u8).init(allocator),
+            .allow_owners = std.array_list.Managed(u32).init(allocator),
+            .allow_names = std.array_list.Managed([]const u8).init(allocator),
+            .allow_keys = std.array_list.Managed(u64).init(allocator),
+            .allocated_strings = std.array_list.Managed([]u8).init(allocator),
             .allocator = allocator,
         };
     }
@@ -86,7 +86,7 @@ pub fn parse_args(allocator: std.mem.Allocator) !Config {
     // If user types `ghostshm --json`, that is `scan --json`.
     
     // Let's implement a simple lookahead or buffer.
-    var arg_list = std.ArrayList([]const u8).init(allocator);
+    var arg_list = std.array_list.Managed([]const u8).init(allocator);
     defer arg_list.deinit();
     
     while (args.next()) |arg| {

@@ -21,7 +21,7 @@ const GREEN = "\x1b[32m";
 const YELLOW = "\x1b[33m";
 const RESET = "\x1b[0m";
 
-fn get_color(cls: sysv_mod.Classification) []const u8 {
+pub fn get_color(cls: sysv_mod.Classification) []const u8 {
     return switch (cls) {
         .likely_orphan => GREEN,
         .possible_orphan => YELLOW,
@@ -30,7 +30,7 @@ fn get_color(cls: sysv_mod.Classification) []const u8 {
     };
 }
 
-fn classification_str(cls: sysv_mod.Classification) []const u8 {
+pub fn classification_str(cls: sysv_mod.Classification) []const u8 {
     return switch (cls) {
         .allowlisted => "allowlisted",
         .in_use => "in_use",
@@ -41,7 +41,7 @@ fn classification_str(cls: sysv_mod.Classification) []const u8 {
     };
 }
 
-fn recommendation_str(rec: sysv_mod.Recommendation) []const u8 {
+pub fn recommendation_str(rec: sysv_mod.Recommendation) []const u8 {
     return switch (rec) {
         .keep => "keep",
         .review => "review",
@@ -50,7 +50,8 @@ fn recommendation_str(rec: sysv_mod.Recommendation) []const u8 {
 }
 
 pub fn print_table(items: []const Item, summary: Summary, no_color: bool) !void {
-    const stdout = std.io.getStdOut().writer();
+    const stdout_file = std.fs.File.stdout();
+    var stdout = stdout_file.deprecatedWriter();
 
     // Sort items: recommendation order (reap, review, keep), then bytes desc
     // We can't sort the input slice in place easily if it's const or mixed pointers.
@@ -62,7 +63,7 @@ pub fn print_table(items: []const Item, summary: Summary, no_color: bool) !void 
         bytes: u64,
     };
 
-    var sorted = try std.ArrayList(SortItem).initCapacity(std.heap.page_allocator, items.len);
+    var sorted = try std.array_list.Managed(SortItem).initCapacity(std.heap.page_allocator, items.len);
     defer sorted.deinit();
 
     for (items, 0..) |item, i| {
@@ -129,110 +130,129 @@ pub fn print_table(items: []const Item, summary: Summary, no_color: bool) !void 
         }
     }
 
+    // Summary
     try stdout.print("\nSYSV_TOTAL_BYTES={d}\n", .{summary.sysv_total_bytes});
     try stdout.print("POSIX_TOTAL_BYTES={d}\n", .{summary.posix_total_bytes});
     try stdout.print("LIKELY_ORPHAN_BYTES={d}\n", .{summary.likely_orphan_bytes});
     try stdout.print("LIKELY_ORPHAN_COUNT={d}\n", .{summary.likely_orphan_count});
     try stdout.print("PARTIAL_PROC_ACCESS={}\n", .{summary.partial_proc_access});
+    
+    // try stdout.flush(); // deprecatedWriter is unbuffered or doesn't expose flush
 }
 
+
 pub fn print_json(items: []const Item, summary: Summary, cfg: anytype, generated_at: u64) !void {
-    const stdout = std.io.getStdOut().writer();
-    // Use std.json
-    // But std.json requires a struct to serialize usually or usage of writeValue.
-    // We'll construct a wrapper struct or use write function manually.
-    // Manual writing is safer for exact schema control.
-    
-    // Actually, `std.json.stringify` is powerful.
-    
-    // We can create a wrapper struct that holds everything?
-    // But items is a union array.
-    
-    var ws = std.json.writeStream(stdout, .{});
-    try ws.beginObject();
-    try ws.objectField("generated_at"); try ws.write(generated_at);
-    try ws.objectField("threshold_seconds"); try ws.write(cfg.threshold_seconds);
-    try ws.objectField("min_bytes"); try ws.write(cfg.min_bytes);
-    try ws.objectField("posix_dir"); try ws.write(cfg.posix_dir);
-    try ws.objectField("partial_proc_access"); try ws.write(summary.partial_proc_access);
-    
-    try ws.objectField("items");
-    try ws.beginArray();
+    const stdout_file = std.fs.File.stdout();
+    var writer = stdout_file.deprecatedWriter();
+
+    const JsonItem = struct {
+        type: []const u8,
+        // SysV fields
+        shmid: ?i32 = null,
+        key: ?[]const u8 = null,
+        nattch: ?u32 = null,
+        perms: ?u32 = null,
+        cpid: ?i32 = null,
+        lpid: ?i32 = null,
+        ctime: ?u64 = null,
+        creator_alive: ?bool = null,
+        creator_pid_reused: ?bool = null,
+        last_alive: ?bool = null,
+        last_pid_reused: ?bool = null,
+        
+        // Posix fields
+        path: ?[]const u8 = null,
+        inode: ?u64 = null,
+        mtime: ?u64 = null,
+        open_pids_count: ?u32 = null,
+        open_pids: ?[]const i32 = null,
+
+        // Common
+        bytes: u64,
+        uid: u32,
+        age_seconds: u64,
+        classification: []const u8,
+        recommendation: []const u8,
+        reclaimable_bytes: u64,
+        reasons: []const []const u8,
+    };
+
+    var json_items = std.array_list.Managed(JsonItem).init(std.heap.page_allocator);
+    defer json_items.deinit();
+
+    // Buffer for hex keys
+    var key_bufs: [128][32]u8 = undefined; // Cycle buffer for hex strings
+    var key_buf_idx: usize = 0;
+
     for (items) |item| {
         switch (item) {
             .sysv => |s| {
-                try ws.beginObject();
-                try ws.objectField("type"); try ws.write("sysv");
-                try ws.objectField("shmid"); try ws.write(s.shmid);
-                
-                // key hex string
-                var buf: [32]u8 = undefined;
-                const k = std.fmt.bufPrint(&buf, "0x{x}", .{s.key}) catch "0x0";
-                try ws.objectField("key"); try ws.write(k);
-                
-                try ws.objectField("bytes"); try ws.write(s.bytes);
-                try ws.objectField("nattch"); try ws.write(s.nattch);
-                try ws.objectField("uid"); try ws.write(s.uid);
-                try ws.objectField("perms"); try ws.write(s.perms);
-                try ws.objectField("cpid"); try ws.write(s.cpid);
-                try ws.objectField("lpid"); try ws.write(s.lpid);
-                try ws.objectField("ctime"); try ws.write(s.ctime);
-                try ws.objectField("age_seconds"); try ws.write(s.age_seconds);
-                try ws.objectField("creator_alive"); try ws.write(s.creator_alive);
-                try ws.objectField("creator_pid_reused"); try ws.write(s.creator_pid_reused);
-                try ws.objectField("last_alive"); try ws.write(s.last_alive);
-                try ws.objectField("last_pid_reused"); try ws.write(s.last_pid_reused);
-                try ws.objectField("classification"); try ws.write(classification_str(s.classification));
-                try ws.objectField("recommendation"); try ws.write(recommendation_str(s.recommendation));
-                try ws.objectField("reclaimable_bytes"); try ws.write(s.reclaimable_bytes);
-                
-                try ws.objectField("reasons");
-                try ws.beginArray();
-                for (s.reasons.items) |r| try ws.write(r);
-                try ws.endArray();
-                
-                try ws.endObject();
+                // Format key hex
+                const buf = &key_bufs[key_buf_idx % 128];
+                key_buf_idx += 1;
+                const k_str = try std.fmt.bufPrint(buf, "0x{x}", .{s.key});
+
+                try json_items.append(.{
+                    .type = "sysv",
+                    .shmid = s.shmid,
+                    .key = k_str,
+                    .nattch = s.nattch,
+                    .perms = s.perms,
+                    .cpid = s.cpid,
+                    .lpid = s.lpid,
+                    .ctime = s.ctime,
+                    .creator_alive = s.creator_alive,
+                    .creator_pid_reused = s.creator_pid_reused,
+                    .last_alive = s.last_alive,
+                    .last_pid_reused = s.last_pid_reused,
+                    .bytes = s.bytes,
+                    .uid = s.uid,
+                    .age_seconds = s.age_seconds,
+                    .classification = classification_str(s.classification),
+                    .recommendation = recommendation_str(s.recommendation),
+                    .reclaimable_bytes = s.reclaimable_bytes,
+                    .reasons = s.reasons.items,
+                });
             },
             .posix => |p| {
-                try ws.beginObject();
-                try ws.objectField("type"); try ws.write("posix");
-                try ws.objectField("path"); try ws.write(p.path);
-                try ws.objectField("inode"); try ws.write(p.inode);
-                try ws.objectField("bytes"); try ws.write(p.bytes);
-                try ws.objectField("uid"); try ws.write(p.uid);
-                try ws.objectField("mtime"); try ws.write(p.mtime);
-                try ws.objectField("age_seconds"); try ws.write(p.age_seconds);
-                try ws.objectField("open_pids_count"); try ws.write(p.open_pids_count);
-                
-                try ws.objectField("open_pids");
-                try ws.beginArray();
-                for (p.open_pids.items) |pid| try ws.write(pid);
-                try ws.endArray();
-                
-                try ws.objectField("classification"); try ws.write(classification_str(p.classification));
-                try ws.objectField("recommendation"); try ws.write(recommendation_str(p.recommendation));
-                try ws.objectField("reclaimable_bytes"); try ws.write(p.reclaimable_bytes);
-                
-                try ws.objectField("reasons");
-                try ws.beginArray();
-                for (p.reasons.items) |r| try ws.write(r);
-                try ws.endArray();
-                
-                try ws.endObject();
+                try json_items.append(.{
+                    .type = "posix",
+                    .path = p.path,
+                    .inode = p.inode,
+                    .mtime = p.mtime,
+                    .open_pids_count = p.open_pids_count,
+                    .open_pids = p.open_pids.items,
+                    .bytes = p.bytes,
+                    .uid = p.uid,
+                    .age_seconds = p.age_seconds,
+                    .classification = classification_str(p.classification),
+                    .recommendation = recommendation_str(p.recommendation),
+                    .reclaimable_bytes = p.reclaimable_bytes,
+                    .reasons = p.reasons.items,
+                });
             }
         }
     }
-    try ws.endArray();
-    
-    try ws.objectField("summary");
-    try ws.beginObject();
-    try ws.objectField("sysv_total_bytes"); try ws.write(summary.sysv_total_bytes);
-    try ws.objectField("posix_total_bytes"); try ws.write(summary.posix_total_bytes);
-    try ws.objectField("likely_orphan_bytes"); try ws.write(summary.likely_orphan_bytes);
-    try ws.objectField("likely_orphan_count"); try ws.write(summary.likely_orphan_count);
-    try ws.endObject();
-    
-    try ws.endObject();
-    // No trailing newline in JSON? "One JSON object to stdout. No trailing text."
-    // std.json writer doesn't add newline.
+
+    const JsonOut = struct {
+        generated_at: u64,
+        threshold_seconds: u64,
+        min_bytes: u64,
+        posix_dir: []const u8,
+        partial_proc_access: bool,
+        items: []const JsonItem,
+        summary: Summary,
+    };
+
+    const out_obj = JsonOut{
+        .generated_at = generated_at,
+        .threshold_seconds = cfg.threshold_seconds,
+        .min_bytes = cfg.min_bytes,
+        .posix_dir = cfg.posix_dir,
+        .partial_proc_access = summary.partial_proc_access,
+        .items = json_items.items,
+        .summary = summary,
+    };
+
+    try writer.print("{f}", .{std.json.fmt(out_obj, .{})});
 }
