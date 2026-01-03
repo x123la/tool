@@ -61,9 +61,12 @@ fn run_scan(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
     for (sysv_items.items) |*item| {
         // Liveness
         if (item.cpid > 0) {
-            const start = proc_mod.get_pid_starttime(allocator, item.cpid) catch |err| {
-                if (err != error.PidNotFound) partial_proc_access_sysv = true;
-                return 0;
+            const start = proc_mod.get_pid_starttime(allocator, item.cpid) catch |err| switch (err) {
+                error.PidNotFound => @as(u64, 0),
+                else => blk: {
+                    partial_proc_access_sysv = true;
+                    break :blk @as(u64, 0);
+                },
             };
             if (start != 0) {
                 item.creator_alive = true;
@@ -76,9 +79,12 @@ fn run_scan(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
             }
         }
         if (item.lpid > 0) {
-            const start = proc_mod.get_pid_starttime(allocator, item.lpid) catch |err| {
-                if (err != error.PidNotFound) partial_proc_access_sysv = true;
-                return 0;
+            const start = proc_mod.get_pid_starttime(allocator, item.lpid) catch |err| switch (err) {
+                error.PidNotFound => @as(u64, 0),
+                else => blk: {
+                    partial_proc_access_sysv = true;
+                    break :blk @as(u64, 0);
+                },
             };
              if (start != 0) {
                 item.last_alive = true;
@@ -187,9 +193,12 @@ fn run_explain(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: t
         for (sysv_items.items) |*item| {
             if (item.shmid == tid) {
                 if (item.cpid > 0) {
-                     const start = proc_mod.get_pid_starttime(allocator, item.cpid) catch |err| {
-                        if (err != error.PidNotFound) partial_proc_access_sysv = true;
-                        return 0;
+                     const start = proc_mod.get_pid_starttime(allocator, item.cpid) catch |err| switch (err) {
+                        error.PidNotFound => @as(u64, 0),
+                        else => blk: {
+                            partial_proc_access_sysv = true;
+                            break :blk @as(u64, 0);
+                        },
                      };
                      if (start != 0) {
                          item.creator_alive = true;
@@ -200,9 +209,12 @@ fn run_explain(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: t
                      }
                 }
                 if (item.lpid > 0) {
-                     const start = proc_mod.get_pid_starttime(allocator, item.lpid) catch |err| {
-                        if (err != error.PidNotFound) partial_proc_access_sysv = true;
-                        return 0;
+                     const start = proc_mod.get_pid_starttime(allocator, item.lpid) catch |err| switch (err) {
+                        error.PidNotFound => @as(u64, 0),
+                        else => blk: {
+                            partial_proc_access_sysv = true;
+                            break :blk @as(u64, 0);
+                        },
                      };
                      if (start != 0) {
                          item.last_alive = true;
@@ -274,14 +286,26 @@ fn run_explain(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: t
             switch (it) {
                 .sysv => |s| {
                     try stdout.print("EXPLAIN TYPE=sysv ID={d}\n", .{s.shmid});
+                    try stdout.print("  key: 0x{x:0>8}\n", .{s.key});
                     try stdout.print("  bytes: {d}\n  age: {d}s\n  nattch: {d}\n", .{s.bytes, s.age_seconds, s.nattch});
-                    try stdout.print("  creator_alive: {}\n  last_alive: {}\n", .{s.creator_alive, s.last_alive});
+                    try stdout.print("  uid: {d}\n  perms: 0o{o}\n", .{s.uid, s.perms});
+                    try stdout.print("  creator_pid: {d} (alive: {}, reused: {})\n", .{s.cpid, s.creator_alive, s.creator_pid_reused});
+                    try stdout.print("  last_pid: {d} (alive: {}, reused: {})\n", .{s.lpid, s.last_alive, s.last_pid_reused});
                     try stdout.print("CLASSIFICATION: {s}\n", .{@tagName(s.classification)});
                     for (s.reasons.items) |r| try stdout.print("- {s}\n", .{r});
                 },
                 .posix => |p| {
                     try stdout.print("EXPLAIN TYPE=posix ID={s}\n", .{p.path});
-                    try stdout.print("  bytes: {d}\n  age: {d}s\n  open_pids: {d}\n", .{p.bytes, p.age_seconds, p.open_pids_count});
+                    try stdout.print("  bytes: {d}\n  age: {d}s\n", .{p.bytes, p.age_seconds});
+                    try stdout.print("  uid: {d}\n", .{p.uid});
+                    try stdout.print("  open_pids_count: {d}\n", .{p.open_pids_count});
+                    if (p.open_pids_count > 0) {
+                        try stdout.print("  open_pids: ", .{});
+                        for (p.open_pids.items, 0..) |pid, i| {
+                            try stdout.print("{d}{s}", .{pid, if (i < p.open_pids.items.len - 1) ", " else ""});
+                        }
+                        try stdout.print("\n", .{});
+                    }
                     try stdout.print("CLASSIFICATION: {s}\n", .{@tagName(p.classification)});
                     for (p.reasons.items) |r| try stdout.print("- {s}\n", .{r});
                 }
@@ -327,9 +351,12 @@ fn run_reap(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
     // Classification & Planning
     for (sysv_items.items) |*item| {
         if (item.cpid > 0) {
-             const start = proc_mod.get_pid_starttime(allocator, item.cpid) catch |err| {
-                 if (err != error.PidNotFound) partial_proc_access_sysv = true;
-                 return 0;
+             const start = proc_mod.get_pid_starttime(allocator, item.cpid) catch |err| switch (err) {
+                 error.PidNotFound => @as(u64, 0),
+                 else => blk: {
+                     partial_proc_access_sysv = true;
+                     break :blk @as(u64, 0);
+                 },
              };
              if (start != 0) {
                  item.creator_alive = true;
@@ -340,9 +367,12 @@ fn run_reap(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
              }
         }
         if (item.lpid > 0) {
-             const start = proc_mod.get_pid_starttime(allocator, item.lpid) catch |err| {
-                 if (err != error.PidNotFound) partial_proc_access_sysv = true;
-                 return 0;
+             const start = proc_mod.get_pid_starttime(allocator, item.lpid) catch |err| switch (err) {
+                 error.PidNotFound => @as(u64, 0),
+                 else => blk: {
+                     partial_proc_access_sysv = true;
+                     break :blk @as(u64, 0);
+                 },
              };
              if (start != 0) {
                  item.last_alive = true;
@@ -405,8 +435,19 @@ fn run_reap(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
     var deleted_count: u64 = 0;
     var failed_count: u64 = 0;
     var deletion_error_occurred = false;
+    var likely_orphan_found = false;
+
+    for (plan.items) |it| {
+        switch (it) {
+            .sysv => |s| if (s.classification == .likely_orphan) { likely_orphan_found = true; },
+            .posix => |p| if (p.classification == .likely_orphan) { likely_orphan_found = true; },
+        }
+    }
 
     if (cfg.apply) {
+        if (cfg.json and !cfg.yes) {
+            return error.MissingYesForJsonApply;
+        }
         if (plan.items.len > 0) {
             if (!cfg.yes and !cfg.json) {
                 const stderr = std.io.getStdErr().writer();
@@ -426,7 +467,7 @@ fn run_reap(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
             }
 
             for (plan.items) |it| {
-                var res = Result{ .kind = "unknown", .id = null, .path = null, .attempted = true, .deleted = false, .error_msg = null };
+                var res = Result{ .kind = "unknown", .id = null, .path = null, .attempted = false, .deleted = false, .error_msg = null };
                 
                 switch (it) {
                     .sysv => |s| {
@@ -434,6 +475,7 @@ fn run_reap(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
                         res.id = s.shmid;
                         // Verification
                         if (sysv_mod.verify_item(s)) |_| {
+                            res.attempted = true;
                             const ret = shmctl(s.shmid, IPC_RMID, null);
                             if (ret == 0) {
                                 res.deleted = true;
@@ -454,6 +496,7 @@ fn run_reap(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
                         res.kind = "posix";
                         res.path = p.path;
                         if (posix_mod.verify_item_alloc(allocator, p)) |_| {
+                             res.attempted = true;
                              const path_z = try allocator.dupeZ(u8, p.path);
                              defer allocator.free(path_z);
                              const ret = unlink(path_z);
@@ -598,7 +641,7 @@ fn run_reap(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
     } else {
         // Dry run
         if (partial_proc_access_sysv or partial_proc_access_posix) return 2;
-        if (plan.items.len > 0) return 1;
+        if (likely_orphan_found) return 1;
         return 0;
     }
 }

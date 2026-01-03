@@ -28,7 +28,7 @@ pub const PosixItem = struct {
 
 
 
-    allocated_strings: std.ArrayList([]u8),
+
 
     pub fn init(allocator: std.mem.Allocator) PosixItem {
         return PosixItem{
@@ -36,7 +36,6 @@ pub const PosixItem = struct {
             .inode = 0, .dev = 0, .bytes = 0, .uid = 0, .mtime = 0, .ctime = 0,
             .open_pids = std.ArrayList(i32).init(allocator),
             .reasons = std.ArrayList([]const u8).init(allocator),
-            .allocated_strings = std.ArrayList([]u8).init(allocator),
         };
     }
 
@@ -44,8 +43,6 @@ pub const PosixItem = struct {
         allocator.free(self.path);
         self.open_pids.deinit();
         self.reasons.deinit();
-        for (self.allocated_strings.items) |s| allocator.free(s);
-        self.allocated_strings.deinit();
     }
 };
 

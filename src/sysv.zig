@@ -1,10 +1,10 @@
 const std = @import("std");
 const config_mod = @import("config.zig"); 
-// Ideally tests shouldn't depend on unimported modules, but integration tests do.
-// We can assume proc_mod is available to the package.
-// But we are in `sysv.zig`. We don't import `proc.zig` currently.
-// I'll add the import.
 
+const c = @cImport({
+    @cInclude("sys/ipc.h");
+    @cInclude("sys/shm.h");
+});
 pub const Classification = enum {
     allowlisted,
     in_use,
@@ -42,20 +42,16 @@ pub const SysVItem = struct {
     recommendation: Recommendation = .keep,
     reclaimable_bytes: u64 = 0,
     reasons: std.ArrayList([]const u8),
-    allocated_strings: std.ArrayList([]u8),
 
     pub fn init(allocator: std.mem.Allocator) SysVItem {
         return SysVItem{
             .shmid = 0, .key = 0, .bytes = 0, .nattch = 0, .uid = 0, .perms = 0, .cpid = 0, .lpid = 0, .ctime = 0,
             .reasons = std.ArrayList([]const u8).init(allocator),
-            .allocated_strings = std.ArrayList([]u8).init(allocator),
         };
     }
 
     pub fn deinit(self: *SysVItem) void {
         self.reasons.deinit();
-        for (self.allocated_strings.items) |s| self.allocated_strings.allocator.free(s);
-        self.allocated_strings.deinit();
     }
 };
 
@@ -140,8 +136,8 @@ pub fn parse_sysv_shm(allocator: std.mem.Allocator, path: []const u8) !std.Array
 
         const perms_str = try get(fields.items, &col_map, "perms");
         var is_octal = true;
-        for (perms_str) |c| {
-            if (c < '0' or c > '7') {
+        for (perms_str) |char| {
+            if (char < '0' or char > '7') {
                 is_octal = false;
                 break;
             }
@@ -259,92 +255,15 @@ pub fn classify_item(item: *SysVItem, cfg: config_mod.Config, current_time: u64,
 }
 
 // Tests
-extern "c" fn shmget(key: c_int, size: usize, shmflg: c_int) c_int;
-extern "c" fn shmat(shmid: c_int, shmaddr: ?*anyopaque, shmflg: c_int) ?*anyopaque;
-extern "c" fn shmdt(shmaddr: ?*anyopaque) c_int;
-extern "c" fn shmctl(shmid: c_int, cmd: c_int, buf: ?*anyopaque) c_int;
 
-const IPC_STAT = 2;
 
-// Partial shmid_ds definition for verification
-const shmid_ds = extern struct {
-    shm_perm: extern struct {
-        uid: u32,
-        gid: u32,
-        cuid: u32,
-        cgid: u32,
-        mode: u32,
-        _seq: u32, // pad or seq
-        __key: i32, 
-        // Layout depends on arch (x86_64). 
-        // Using explicit padding might be safer or using libc headers if available.
-        // Zig translates C headers if allowed.
-        // Let's assume standard linux x86_64 layout or close enough for checking size/ctime?
-        // Actually, struct layout varies. Using raw bytes or strict definition is hard without verify.
-        // Better to check `bytes` (shm_segsz) and `ctime` (shm_ctime).
-    },
-    shm_segsz: usize,
-    shm_atime: c_long,
-    shm_dtime: c_long,
-    shm_ctime: c_long,
-    shm_cpid: i32,
-    shm_lpid: i32,
-    shm_nattch: usize,
-    // plus more padding
-};
 
-// We can try to use a simplified check or `shmctl` behavior.
-// If we can't reliably define shmid_ds without importing a C header, we risk reading garbage.
-// But we can limit our check to simple fields if we are careful.
-// Or we can rely on `scan`'s view being "good enough" if we accept some risk, 
-// BUT input says "Add re-validation... safety critical".
-// So we MUST try.
-// Standard `shmid_ds` on Linux x86_64?
-// Let's define a wrapper that roughly matches.
-// Actually, `man shmctl` says `struct shmid_ds`.
-// `shm_perm` is `struct ipc_perm`.
-// `ipc_perm` is key(4), uid(4), gid(4), cuid(4), cgid(4), mode(4), seq(4)? No.
-// Safe approach: Define enough space and use offsets? No.
-// Let's use `extern struct` matching standard clib.
-
-const ipc_perm = extern struct {
-    __key: i32,
-    uid: u32,
-    gid: u32,
-    cuid: u32,
-    cgid: u32,
-    mode: u16,
-    __pad1: u16,
-    __seq: u16,
-    __pad2: u16,
-    __unused1: c_ulong,
-    __unused2: c_ulong,
-};
-
-const shmid_ds_linux = extern struct {
-    shm_perm: ipc_perm,
-    shm_segsz: usize,
-    shm_atime: c_long,
-    shm_dtime: c_long,
-    shm_ctime: c_long,
-    shm_cpid: i32,
-    shm_lpid: i32,
-    shm_nattch: usize,
-    __unused4: c_ulong,
-    __unused5: c_ulong,
-};
 
 pub fn verify_item(item: *SysVItem) !void {
-    var ds: shmid_ds_linux = undefined;
-    if (shmctl(@intCast(item.shmid), IPC_STAT, &ds) != 0) {
+    var ds: c.shmid_ds = undefined;
+    if (c.shmctl(@intCast(item.shmid), c.IPC_STAT, &ds) != 0) {
         return error.VerificationFailed;
     }
-    
-    // Check consistency
-    // Note: ctime is stable? yes, set on creation or ipc_set.
-    // bytes should match.
-    // nattch should match 0 (orphan) if we think it's orphan?
-    // User request: "ds.shm_nattch == 0 still holds (must be zero at delete time)"
     
     // Check size
     if (ds.shm_segsz != item.bytes) return error.SizeMismatch;
@@ -353,7 +272,6 @@ pub fn verify_item(item: *SysVItem) !void {
     if (@as(u64, @intCast(ds.shm_ctime)) != item.ctime) return error.CtimeMismatch;
     
     // Check nattch
-    // If we are reaping, it SHOULD be 0.
     if (ds.shm_nattch > 0) return error.Attached;
 }
 
@@ -395,12 +313,12 @@ test "integration sysv orphan detection" {
     if (pid == 0) {
         // Child
         const IPC_PRIVATE = 0;
-        const id = shmget(IPC_PRIVATE, 4096, 0o1000 | 0o600);
+        const id = c.shmget(IPC_PRIVATE, 4096, 0o1000 | 0o600);
         if (id < 0) std.posix.exit(1);
 
-        const ptr = shmat(id, null, 0);
+        const ptr = c.shmat(id, null, 0);
         if (@intFromPtr(ptr) == @as(usize, @bitCast(@as(isize, -1)))) std.posix.exit(2);
-        _ = shmdt(ptr);
+        _ = c.shmdt(ptr);
         
         const file = std.fs.cwd().createFile("sysv_id.txt", .{}) catch std.posix.exit(3);
         const writer = file.writer();
@@ -421,7 +339,7 @@ test "integration sysv orphan detection" {
         const n = try file.readAll(&buf);
         const id = try std.fmt.parseInt(i32, buf[0..n], 10);
         
-        defer _ = shmctl(id, 0, null); // IPC_RMID=0
+        defer _ = c.shmctl(id, 0, null); // IPC_RMID=0
 
         // Scan
         var cfg = config_mod.Config.init(allocator);

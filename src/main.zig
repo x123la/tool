@@ -15,6 +15,7 @@ pub fn main() !void {
             error.UnknownFlag,
             error.InvalidDuration,
             error.MissingExplainId,
+            error.MissingYesForJsonApply,
             error.Overflow, // integer parsing
             error.InvalidCharacter // integer parsing
             => {
