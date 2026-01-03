@@ -6,10 +6,11 @@ const time_mod = @import("time.zig");
 const proc_mod = @import("proc.zig");
 const output_mod = @import("output.zig");
 
-// IPC consts (Linux)
-const IPC_RMID = 0;
+const c_shm = @cImport({
+    @cInclude("sys/ipc.h");
+    @cInclude("sys/shm.h");
+});
 
-extern "c" fn shmctl(shmid: c_int, cmd: c_int, buf: ?*anyopaque) c_int;
 extern "c" fn unlink(path: [*:0]const u8) c_int;
 
 pub fn run(allocator: std.mem.Allocator) !u8 {
@@ -445,10 +446,10 @@ fn run_reap(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
     }
 
     if (cfg.apply) {
-        if (cfg.json and !cfg.yes) {
-            return error.MissingYesForJsonApply;
-        }
         if (plan.items.len > 0) {
+            if (cfg.json and !cfg.yes) {
+                return error.MissingYesForJsonApply;
+            }
             if (!cfg.yes and !cfg.json) {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.print("\nWARNING: You are about to DELETE {d} items totaling {d} bytes.\n", .{plan.items.len, planned_total_bytes});
@@ -476,7 +477,7 @@ fn run_reap(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
                         // Verification
                         if (sysv_mod.verify_item(s)) |_| {
                             res.attempted = true;
-                            const ret = shmctl(s.shmid, IPC_RMID, null);
+                            const ret = c_shm.shmctl(s.shmid, c_shm.IPC_RMID, null);
                             if (ret == 0) {
                                 res.deleted = true;
                                 deleted_count += 1;
@@ -487,8 +488,6 @@ fn run_reap(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
                                 res.error_msg = try std.fmt.allocPrint(allocator, "errno={d}", .{err});
                             }
                         } else |ver_err| {
-                             failed_count += 1;
-                             deletion_error_occurred = true;
                              res.error_msg = try std.fmt.allocPrint(allocator, "verification_failed: {s}", .{@errorName(ver_err)});
                         }
                     },
@@ -510,8 +509,6 @@ fn run_reap(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
                                  res.error_msg = try std.fmt.allocPrint(allocator, "errno={d}", .{err});
                              }
                         } else |ver_err| {
-                             failed_count += 1;
-                             deletion_error_occurred = true;
                              res.error_msg = try std.fmt.allocPrint(allocator, "verification_failed: {s}", .{@errorName(ver_err)});
                         }
                     }
