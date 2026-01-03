@@ -4,55 +4,96 @@ ghostshm is a Linux CLI utility for detecting and safely reaping orphaned shared
 
 ## Safety Model
 
-By default, `ghostshm` operates in a read-only **dry-run** mode.
-- `scan` only lists items.
-- `reap` prints a deletion plan but does NOT delete anything unless `--apply` is passed.
-- Even with `--apply`, the tool requires an interactive confirmation (typing `DELETE`) unless `--yes` is specified.
-- Use of color coding (Green=Likely Orphan, Yellow=Possible Orphan, Red=Risky) helps users quickly assess the state of their system.
+Safety is a primary design goal. `ghostshm` follows a conservative approach:
+- **Dry-run by default**: Commands never delete data unless `--apply` is explicitly provided.
+- **Verification**: Before any deletion, the tool re-validates the segment state (e.g., using `shmctl(IPC_STAT)` or `stat()`) to ensure no process attached between the scan and the reap.
+- **Conservative Classification**: If the tool cannot fully scan `/proc` (e.g., due to permissions), it marks ambiguous items as `unknown` and refuses to reap them automatically.
+- **Interactive Safeguard**: Even with `--apply`, users must type `DELETE` to confirm unless `--yes` is used.
+- **PID Reuse Protection**: Compares segment creation time against PID start times to avoid misidentifying recycled PIDs.
+
+## Usage
+
+```bash
+# Scan for orphans (default view)
+ghostshm scan
+
+# Scan and output JSON
+ghostshm scan --json
+
+# Explain classification for a specific ID
+ghostshm explain 12345
+ghostshm explain posix:/dev/shm/my_shm
+
+# Reap orphans (actual deletion)
+ghostshm reap --apply --yes
+```
+
+### Common Flags
+- `--threshold <dur>`: Minimum age of segment (e.g., `30m`, `1h`, `0s`). Default: `30m`.
+- `--min-bytes <n>`: Ignore segments smaller than this. Default: `64KB`.
+- `--allow-owner <uid>`: Whitelist a specific user.
+- `--allow-name <substring>`: Whitelist POSIX paths containing substring.
+- `--allow-key <hex/dec>`: Whitelist specific SysV key.
+- `--json`: Output valid JSON for machine processing.
+
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0    | Success (No orphans found / All actions completed). |
+| 1    | Orphans found (Scan / Reap dry-run). |
+| 2    | Partial access / Uncertainty (Conservative mode) OR a deletion failed. |
+| 64   | CLI usage error (Invalid flags, missing arguments). |
+| 70   | System/Fatal error (Critical files unreadable). |
+
+## JSON Schema (Simplified)
+
+### Scan Mode
+```json
+{
+  "now": 123456789,
+  "items": [
+    {
+      "type": "sysv|posix",
+      "id": 12345,
+      "bytes": 1024,
+      "classification": "likely_orphan|...",
+      "recommendation": "reap|keep|review",
+      "reasons": [...]
+    }
+  ],
+  "summary": { ... }
+}
+```
+
+### Reap Mode
+```json
+{
+  "apply": true|false,
+  "planned_deletions": [...],
+  "results": [
+    {
+       "kind": "sysv|posix",
+       "id": 12345,
+       "attempted": true|false,
+       "deleted": true|false,
+       "error": null|"reason"
+    }
+  ],
+  "deleted_count": 1,
+  "failed_count": 0
+}
+```
 
 ## Build Instructions
+
+Requires **Zig 0.13.0**.
 
 ```bash
 zig build -Doptimize=ReleaseSafe
 ```
 
-The resulting binary will be located in `zig-out/bin/ghostshm`.
+Binary is produced at `zig-out/bin/ghostshm`.
 
-## Usage Examples
-
-**Scan for orphans (default view):**
-```bash
-ghostshm scan
-```
-
-**Scan and output JSON (for machine parsing):**
-```bash
-ghostshm scan --json
-```
-
-**Explain why a specific ID is classified as it is:**
-```bash
-ghostshm explain 1234
-# OR for POSIX
-ghostshm explain posix:/dev/shm/my_shm_file
-```
-
-**Reap (dry run - just shows what would happen):**
-```bash
-ghostshm reap
-```
-
-**Reap (actual deletion, interactive confirm):**
-```bash
-ghostshm reap --apply
-```
-
-**Reap (actual deletion, non-interactive):**
-```bash
-ghostshm reap --apply --yes
-```
-
-## Limitations
-
-- **PID Reuse**: The tool attempts to detect PID reuse by checking start times against system boot time and segment creation times. However, extremely rapid PID reuse (within the same second tick) might theoretically race, though unlikely in practice for this use case.
-- **Permission Limits**: The tool relies on scanning `/proc/<pid>/fd`. If run as a non-root user, it may not be able to list FDs of processes owned by other users. This results in "partial proc access" state, where the tool will degrade gracefully: it stays conservative and will refuse to classify POSIX objects as "likely orphans" if it cannot fully verify that no other process has them open.
+## License
+MIT
