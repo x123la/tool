@@ -12,6 +12,7 @@ pub const PosixItem = struct {
     uid: u32,
     mtime: u64,
     ctime: u64,
+    mode: u32,
 
     // Open handles
     open_pids: std.array_list.Managed(i32),
@@ -33,7 +34,7 @@ pub const PosixItem = struct {
     pub fn init(allocator: std.mem.Allocator) PosixItem {
         return PosixItem{
             .path = undefined,
-            .inode = 0, .dev = 0, .bytes = 0, .uid = 0, .mtime = 0, .ctime = 0,
+            .inode = 0, .dev = 0, .bytes = 0, .uid = 0, .mtime = 0, .ctime = 0, .mode = 0,
             .open_pids = std.array_list.Managed(i32).init(allocator),
             .reasons = std.array_list.Managed([]const u8).init(allocator),
         };
@@ -77,6 +78,7 @@ pub fn scan_posix_dir(allocator: std.mem.Allocator, dir_path: []const u8) !std.a
         item.uid = st.uid;
         item.mtime = @intCast(st.mtim.sec);
         item.ctime = @intCast(st.ctim.sec);
+        item.mode = st.mode;
 
         try items.append(item);
     }
@@ -180,16 +182,24 @@ pub fn classify_item(item: *PosixItem, cfg: config_mod.Config, current_time: u64
 
     // Partial proc access
     if (partial_proc_access) {
-        item.classification = .unknown;
-        item.recommendation = .review;
-        item.reclaimable_bytes = 0;
-        try item.reasons.append("INSUFFICIENT_PROC_PERMS");
-        if (item.age_seconds >= cfg.threshold_seconds) {
-            try item.reasons.append("OLDER_THAN_THRESHOLD");
+        const current_uid = std.posix.getuid();
+        const is_private = (item.mode & 0o077) == 0; // No group or other permissions
+
+        if (item.uid == current_uid and is_private) {
+            try item.reasons.append("PARTIAL_PROC_OVERRIDE_PRIVATE");
+            // Proceed to normal classification
         } else {
-            try item.reasons.append("YOUNGER_THAN_THRESHOLD");
+            item.classification = .unknown;
+            item.recommendation = .review;
+            item.reclaimable_bytes = 0;
+            try item.reasons.append("INSUFFICIENT_PROC_PERMS");
+            if (item.age_seconds >= cfg.threshold_seconds) {
+                try item.reasons.append("OLDER_THAN_THRESHOLD");
+            } else {
+                try item.reasons.append("YOUNGER_THAN_THRESHOLD");
+            }
+            return;
         }
-        return;
     }
 
     // Full proc access
@@ -198,10 +208,6 @@ pub fn classify_item(item: *PosixItem, cfg: config_mod.Config, current_time: u64
         item.recommendation = .reap;
         item.reclaimable_bytes = item.bytes;
         try item.reasons.append("OLDER_THAN_THRESHOLD");
-    } else if (item.age_seconds >= (cfg.threshold_seconds / 2)) {
-        item.classification = .possible_orphan;
-        item.recommendation = .review;
-        try item.reasons.append("YOUNGER_THAN_THRESHOLD");
     } else {
         item.classification = .unknown;
         item.recommendation = .keep;

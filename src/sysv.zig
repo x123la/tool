@@ -124,8 +124,11 @@ pub fn parse_sysv_shm(allocator: std.mem.Allocator, path: []const u8) !std.array
 
         item.shmid = try std.fmt.parseInt(i32, try get(fields.items, &col_map, "shmid"), 10);
         
+        // Keys in /proc are printed as signed 32-bit integers.
+        // We must parse as i32, bitcast to u32 to get the unsigned representation, and then cast to u64 to match our struct.
         const key_str = try get(fields.items, &col_map, "key");
-        item.key = @bitCast(try std.fmt.parseInt(i64, key_str, 0));
+        const key_i32 = try std.fmt.parseInt(i32, key_str, 0); 
+        item.key = @intCast(@as(u32, @bitCast(key_i32)));
 
         item.bytes = try std.fmt.parseInt(u64, try get(fields.items, &col_map, "bytes"), 10);
         item.nattch = try std.fmt.parseInt(u32, try get(fields.items, &col_map, "nattch"), 10);

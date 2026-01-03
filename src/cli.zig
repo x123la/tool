@@ -138,7 +138,7 @@ fn run_scan(allocator: std.mem.Allocator, cfg: config_mod.Config, sys_time: time
     if (cfg.json) {
         try output_mod.print_json(items.items, summary, cfg, now);
     } else {
-        try output_mod.print_table(items.items, summary, cfg.no_color);
+        try output_mod.print_table(items.items, summary, cfg);
     }
 
     if (summary.partial_proc_access) return 2;

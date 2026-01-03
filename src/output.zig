@@ -1,6 +1,7 @@
 const std = @import("std");
 const sysv_mod = @import("sysv.zig");
 const posix_mod = @import("posix.zig");
+const config_mod = @import("config.zig");
 
 pub const Item = union(enum) {
     sysv: *sysv_mod.SysVItem,
@@ -49,7 +50,7 @@ pub fn recommendation_str(rec: sysv_mod.Recommendation) []const u8 {
     };
 }
 
-pub fn print_table(items: []const Item, summary: Summary, no_color: bool) !void {
+pub fn print_table(items: []const Item, summary: Summary, cfg: config_mod.Config) !void {
     const stdout_file = std.fs.File.stdout();
     var stdout = stdout_file.deprecatedWriter();
 
@@ -75,6 +76,17 @@ pub fn print_table(items: []const Item, summary: Summary, no_color: bool) !void 
             .sysv => |s| s.bytes,
             .posix => |p| p.bytes,
         };
+        const classification: sysv_mod.Classification = switch (item) {
+             .sysv => |s| s.classification,
+             .posix => |p| p.classification,
+        };
+
+        // Noise filter:
+        // If not verbose, and size < min_bytes, and NOT likely_orphan (safety), skip.
+        if (!cfg.verbose and bytes < cfg.min_bytes and classification != .likely_orphan) {
+            continue;
+        }
+
         const score: u8 = switch (rec) {
             .reap => 0,
             .review => 1,
@@ -96,8 +108,8 @@ pub fn print_table(items: []const Item, summary: Summary, no_color: bool) !void 
     for (sorted.items) |si| {
         switch (si.ptr) {
             .sysv => |s| {
-                const color = if (no_color) "" else get_color(s.classification);
-                const rst = if (no_color) "" else RESET;
+                const color = if (cfg.no_color) "" else get_color(s.classification);
+                const rst = if (cfg.no_color) "" else RESET;
                 const cls_s = classification_str(s.classification);
                 const rec_s = recommendation_str(s.recommendation);
                 // ID is shmid (i32)
@@ -108,8 +120,8 @@ pub fn print_table(items: []const Item, summary: Summary, no_color: bool) !void 
                     .{s.shmid, s.bytes, s.age_seconds, s.nattch, s.uid, color, cls_s, rst, rec_s});
             },
             .posix => |p| {
-                const color = if (no_color) "" else get_color(p.classification);
-                const rst = if (no_color) "" else RESET;
+                const color = if (cfg.no_color) "" else get_color(p.classification);
+                const rst = if (cfg.no_color) "" else RESET;
                 const cls_s = classification_str(p.classification);
                 const rec_s = recommendation_str(p.recommendation);
                 // ID is basename of file (not full path)
