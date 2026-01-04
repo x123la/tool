@@ -1,3 +1,8 @@
+# C build artifacts
+ghostshm
+tests/helpers/create_shm_key
+tests/helpers/sysv_attach
+
 # Zig build artifacts
 zig-cache/
 zig-out/
