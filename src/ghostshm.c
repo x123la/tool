@@ -49,6 +49,7 @@ typedef struct {
   bool force;
   bool yes;
   bool verbose;
+  bool deep;
   char *posix_dir;
   // Lists could be implemented as dynamic arrays, but for simplicity/robustness
   // in a tiny CLI, we might use fixed size or simple linked lists. Given
@@ -76,6 +77,9 @@ static uint64_t boot_time = 0;
 static uint64_t current_time = 0;
 static bool partial_proc_access_sysv = false;
 static bool partial_proc_access_posix = false;
+static dev_t posix_dev = 0;
+static bool posix_dev_valid = false;
+static bool posix_mappings_available = false;
 
 // --- Helper Functions ---
 
@@ -138,8 +142,11 @@ static uint64_t get_pid_starttime(int pid) {
   snprintf(path, sizeof(path), "/proc/%d/stat", pid);
 
   FILE *f = fopen(path, "r");
-  if (!f)
+  if (!f) {
+    if (errno == EACCES || errno == EPERM)
+      partial_proc_access_sysv = true;
     return 0;
+  }
 
   char buf[MAX_LINE];
   // We need to handle process names with spaces/parens.
@@ -224,10 +231,47 @@ static void json_obj_start() {
 
 static void json_obj_end() { fprintf(stdout, "}"); }
 
+static void json_print_escaped(const char *val) {
+  const unsigned char *p = (const unsigned char *)val;
+  for (; *p; p++) {
+    switch (*p) {
+    case '\"':
+      fputs("\\\"", stdout);
+      break;
+    case '\\':
+      fputs("\\\\", stdout);
+      break;
+    case '\b':
+      fputs("\\b", stdout);
+      break;
+    case '\f':
+      fputs("\\f", stdout);
+      break;
+    case '\n':
+      fputs("\\n", stdout);
+      break;
+    case '\r':
+      fputs("\\r", stdout);
+      break;
+    case '\t':
+      fputs("\\t", stdout);
+      break;
+    default:
+      if (*p < 0x20)
+        fprintf(stdout, "\\u%04x", *p);
+      else
+        fputc(*p, stdout);
+    }
+  }
+}
+
 static void json_key_s(const char *key, const char *val) {
   fprintf(stdout, "\"%s\": ", key);
-  if (val)
-    fprintf(stdout, "\"%s\"", val);
+  if (val) {
+    fputc('"', stdout);
+    json_print_escaped(val);
+    fputc('"', stdout);
+  }
   else
     fprintf(stdout, "null");
 }
@@ -243,7 +287,9 @@ static void json_key_b(const char *key, bool val) {
 static void json_key_reasons(const char **reasons, int count) {
   fprintf(stdout, "\"reasons\": [");
   for (int i = 0; i < count; i++) {
-    fprintf(stdout, "\"%s\"%s", reasons[i], (i < count - 1) ? ", " : "");
+    fputc('"', stdout);
+    json_print_escaped(reasons[i]);
+    fprintf(stdout, "\"%s", (i < count - 1) ? ", " : "");
   }
   fprintf(stdout, "]");
 }
@@ -342,6 +388,17 @@ static void analyze_sysv_item(SysVItem *item, Config *cfg) {
     return;
   }
 
+  if (partial_proc_access_sysv && (!c_alive || !l_alive)) {
+    item->class = CLASS_UNKNOWN;
+    item->rec = REC_REVIEW;
+    item->reasons[item->reason_count++] = "PROC_ACCESS_DENIED";
+    if (item->age >= cfg->threshold_seconds)
+      item->reasons[item->reason_count++] = "OLDER_THAN_THRESHOLD";
+    else
+      item->reasons[item->reason_count++] = "YOUNGER_THAN_THRESHOLD";
+    return;
+  }
+
   // Threshold
   if (item->age >= cfg->threshold_seconds) {
     item->reasons[item->reason_count++] = "OLDER_THAN_THRESHOLD";
@@ -395,7 +452,11 @@ typedef struct {
   // Derived
   uint64_t age;
   int open_pids[32];
-  int open_pids_count;
+  int open_pids_stored;
+  int open_pids_total;
+  int mapped_pids[32];
+  int mapped_pids_stored;
+  int mapped_pids_total;
 
   Classification class;
   Recommendation rec;
@@ -425,6 +486,9 @@ typedef struct {
 static OpenHandle *open_handles = NULL;
 static size_t open_handles_count = 0;
 static size_t open_handles_cap = 0;
+static OpenHandle *mapped_handles = NULL;
+static size_t mapped_handles_count = 0;
+static size_t mapped_handles_cap = 0;
 
 static void add_open_handle(uint64_t dev, uint64_t ino, int pid) {
   if (open_handles_count == open_handles_cap) {
@@ -437,6 +501,19 @@ static void add_open_handle(uint64_t dev, uint64_t ino, int pid) {
     open_handles_cap = new_cap;
   }
   open_handles[open_handles_count++] = (OpenHandle){dev, ino, pid};
+}
+
+static void add_mapped_handle(uint64_t dev, uint64_t ino, int pid) {
+  if (mapped_handles_count == mapped_handles_cap) {
+    size_t new_cap = (mapped_handles_cap == 0) ? 1024 : mapped_handles_cap * 2;
+    mapped_handles = realloc(mapped_handles, new_cap * sizeof(OpenHandle));
+    if (!mapped_handles) {
+      perror("realloc");
+      exit(1);
+    }
+    mapped_handles_cap = new_cap;
+  }
+  mapped_handles[mapped_handles_count++] = (OpenHandle){dev, ino, pid};
 }
 
 static void scan_proc_fds() {
@@ -471,10 +548,8 @@ static void scan_proc_fds() {
 
       struct stat st;
       if (stat(link_path, &st) == 0) {
-        // Optimization: Filter by calling `major` on dev? Or just store all.
-        // We'll trust correlation later. Storing all is expensive if system is
-        // busy. Better: Only store if it looks like a SHM file? stat st_dev
-        // must match tmpfs? Hard to know without `stat /dev/shm`.
+        if (posix_dev_valid && st.st_dev != posix_dev)
+          continue;
         add_open_handle(st.st_dev, st.st_ino, pid);
       }
     }
@@ -483,19 +558,110 @@ static void scan_proc_fds() {
   closedir(d);
 }
 
+static void scan_proc_maps_for_pid(int pid) {
+  char maps_path[MAX_PATH];
+  snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+  FILE *f = fopen(maps_path, "r");
+  if (!f) {
+    if (errno == EACCES || errno == EPERM)
+      partial_proc_access_posix = true;
+    return;
+  }
+
+  posix_mappings_available = true;
+  char line[MAX_LINE];
+  while (fgets(line, sizeof(line), f)) {
+    char *path = strstr(line, POSIX_SHM_ROOT "/");
+    if (!path)
+      continue;
+    char *newline = strchr(path, '\n');
+    if (newline)
+      *newline = '\0';
+    char *deleted = strstr(path, " (deleted)");
+    if (deleted)
+      *deleted = '\0';
+
+    struct stat st;
+    if (stat(path, &st) == 0) {
+      if (posix_dev_valid && st.st_dev != posix_dev)
+        continue;
+      add_mapped_handle(st.st_dev, st.st_ino, pid);
+    }
+  }
+  fclose(f);
+}
+
+static void scan_proc_mappings() {
+  DIR *d = opendir("/proc");
+  if (!d)
+    return;
+
+  struct dirent *de;
+  while ((de = readdir(d)) != NULL) {
+    if (!isdigit(de->d_name[0]))
+      continue;
+    int pid = atoi(de->d_name);
+
+    char map_dir[MAX_PATH];
+    snprintf(map_dir, sizeof(map_dir), "/proc/%d/map_files", pid);
+    DIR *md = opendir(map_dir);
+    if (md) {
+      posix_mappings_available = true;
+      size_t before = mapped_handles_count;
+      struct dirent *mde;
+      while ((mde = readdir(md)) != NULL) {
+        if (mde->d_name[0] == '.')
+          continue;
+        char link_path[MAX_PATH];
+        snprintf(link_path, sizeof(link_path), "/proc/%d/map_files/%s", pid,
+                 mde->d_name);
+        struct stat st;
+        if (stat(link_path, &st) == 0) {
+          if (posix_dev_valid && st.st_dev != posix_dev)
+            continue;
+          add_mapped_handle(st.st_dev, st.st_ino, pid);
+        } else if (errno == EACCES || errno == EPERM) {
+          partial_proc_access_posix = true;
+        }
+      }
+      closedir(md);
+      if (mapped_handles_count == before)
+        scan_proc_maps_for_pid(pid);
+      continue;
+    }
+
+    if (errno == EACCES || errno == EPERM) {
+      partial_proc_access_posix = true;
+      continue;
+    }
+
+    scan_proc_maps_for_pid(pid);
+  }
+  closedir(d);
+}
+
 static void analyze_posix_item(PosixItem *item, Config *cfg) {
   item->reason_count = 0;
 
   // Correlate
-  item->open_pids_count = 0;
+  item->open_pids_stored = 0;
+  item->open_pids_total = 0;
+  item->mapped_pids_stored = 0;
+  item->mapped_pids_total = 0;
   for (size_t i = 0; i < open_handles_count; i++) {
     if (open_handles[i].dev == item->dev &&
         open_handles[i].ino == item->inode) {
-      if (item->open_pids_count < 32) {
-        item->open_pids[item->open_pids_count++] = open_handles[i].pid;
-      } else {
-        item->open_pids_count++; // Just count
-      }
+      item->open_pids_total++;
+      if (item->open_pids_stored < 32)
+        item->open_pids[item->open_pids_stored++] = open_handles[i].pid;
+    }
+  }
+  for (size_t i = 0; i < mapped_handles_count; i++) {
+    if (mapped_handles[i].dev == item->dev &&
+        mapped_handles[i].ino == item->inode) {
+      item->mapped_pids_total++;
+      if (item->mapped_pids_stored < 32)
+        item->mapped_pids[item->mapped_pids_stored++] = mapped_handles[i].pid;
     }
   }
 
@@ -516,15 +682,32 @@ static void analyze_posix_item(PosixItem *item, Config *cfg) {
     return;
   }
 
-  if (item->open_pids_count > 0) {
+  item->age = (current_time > item->mtime) ? (current_time - item->mtime) : 0;
+
+  if (item->open_pids_total > 0 || item->mapped_pids_total > 0) {
     item->class = CLASS_IN_USE;
     item->rec = REC_KEEP;
-    item->reasons[item->reason_count++] = "OPEN_HANDLES_PRESENT";
+    if (item->open_pids_total > 0)
+      item->reasons[item->reason_count++] = "OPEN_HANDLES_PRESENT";
+    if (item->mapped_pids_total > 0)
+      item->reasons[item->reason_count++] = "MAPPINGS_PRESENT";
     return;
   }
   item->reasons[item->reason_count++] = "NO_OPEN_HANDLES";
-
-  item->age = (current_time > item->mtime) ? (current_time - item->mtime) : 0;
+  if (posix_mappings_available)
+    item->reasons[item->reason_count++] = "NO_MAPPINGS";
+  else {
+    item->reasons[item->reason_count++] = "MAPPING_SCAN_UNAVAILABLE";
+    if (!cfg->deep) {
+      item->class = CLASS_UNKNOWN;
+      item->rec = REC_REVIEW;
+      if (item->age >= cfg->threshold_seconds)
+        item->reasons[item->reason_count++] = "OLDER_THAN_THRESHOLD";
+      else
+        item->reasons[item->reason_count++] = "YOUNGER_THAN_THRESHOLD";
+      return;
+    }
+  }
 
   // Min Bytes
   if (item->bytes < cfg->min_bytes) {
@@ -587,8 +770,10 @@ typedef void (*ItemHandler)(void *item, bool is_sysv, Config *cfg, void *ctx);
 static void process_items(Config *cfg, ItemHandler handler, void *ctx) {
   // SysV
   if (cfg->target_type == TARGET_SYSV || cfg->target_type == TARGET_BOTH) {
+    bool sysv_scanned = false;
     FILE *f = fopen(SYSV_SHM_PATH, "r");
     if (f) {
+      sysv_scanned = true;
       char line[MAX_LINE];
       fgets(line, sizeof(line), f);
       while (fgets(line, sizeof(line), f)) {
@@ -642,12 +827,64 @@ static void process_items(Config *cfg, ItemHandler handler, void *ctx) {
         handler(&item, true, cfg, ctx);
       }
       fclose(f);
+    } else if (errno == EACCES || errno == EPERM) {
+      partial_proc_access_sysv = true;
+    }
+
+#ifdef SHM_INFO
+    if (!sysv_scanned) {
+      struct shm_info info;
+      int maxid = shmctl(0, SHM_INFO, (struct shmid_ds *)&info);
+      if (maxid >= 0) {
+        sysv_scanned = true;
+#ifdef SHM_STAT
+        for (int i = 0; i <= maxid; i++) {
+          struct shmid_ds ds;
+          errno = 0;
+          int shmid = shmctl(i, SHM_STAT, &ds);
+          if (shmid < 0) {
+            if (errno == EACCES || errno == EPERM)
+              partial_proc_access_sysv = true;
+            continue;
+          }
+          SysVItem item = {0};
+          item.id = shmid;
+#ifdef __GLIBC__
+          item.key = (uint32_t)ds.shm_perm.__key;
+#endif
+          item.perm = ds.shm_perm.mode;
+          item.bytes = ds.shm_segsz;
+          item.cpid = ds.shm_cpid;
+          item.lpid = ds.shm_lpid;
+          item.nattch = ds.shm_nattch;
+          item.uid = ds.shm_perm.uid;
+          item.ctime = ds.shm_ctime;
+          analyze_sysv_item(&item, cfg);
+          handler(&item, true, cfg, ctx);
+        }
+#endif
+      }
+    }
+#endif
+
+    if (!sysv_scanned) {
+      fprintf(stderr,
+              "warning: SysV scan unavailable "
+              "(no %s and shmctl SHM_INFO failed)\n",
+              SYSV_SHM_PATH);
     }
   }
   // POSIX
   if (cfg->target_type == TARGET_POSIX || cfg->target_type == TARGET_BOTH) {
-    if (open_handles_count == 0 && !partial_proc_access_posix)
+    struct stat posix_st;
+    if (stat(cfg->posix_dir, &posix_st) == 0) {
+      posix_dev = posix_st.st_dev;
+      posix_dev_valid = true;
+    }
+    if (open_handles_count == 0)
       scan_proc_fds();
+    if (mapped_handles_count == 0)
+      scan_proc_mappings();
     DIR *d = opendir(cfg->posix_dir);
     if (d) {
       struct dirent *de;
@@ -898,11 +1135,18 @@ static void explain_handler(void *p, bool is_sysv, Config *cfg, void *ctx) {
                 (unsigned long long)item->bytes);
         fprintf(stdout, "Owner UID:   %d\n", item->uid);
         fprintf(stdout, "Mode:        %o\n", item->mode);
-        fprintf(stdout, "Open Handles:%d\n", item->open_pids_count);
-        if (item->open_pids_count > 0) {
-          fprintf(stdout, "    PIDs: ");
-          for (int i = 0; i < item->open_pids_count; i++)
+        fprintf(stdout, "Open Handles:%d\n", item->open_pids_total);
+        if (item->open_pids_stored > 0) {
+          fprintf(stdout, "    Open PIDs: ");
+          for (int i = 0; i < item->open_pids_stored; i++)
             fprintf(stdout, "%d ", item->open_pids[i]);
+          fprintf(stdout, "\n");
+        }
+        fprintf(stdout, "Mapped Handles:%d\n", item->mapped_pids_total);
+        if (item->mapped_pids_stored > 0) {
+          fprintf(stdout, "    Mapped PIDs: ");
+          for (int i = 0; i < item->mapped_pids_stored; i++)
+            fprintf(stdout, "%d ", item->mapped_pids[i]);
           fprintf(stdout, "\n");
         }
         fprintf(stdout, "Verified Age:%llu s\n", (unsigned long long)item->age);
@@ -931,7 +1175,8 @@ static void usage() {
       stderr,
       "  --sysv, --posix       Target specific subsystem (default: both)\n");
   fprintf(stderr, "  --json                Output JSON\n");
-  fprintf(stderr, "  --yes                 Confirm reaping\n");
+  fprintf(stderr, "  --yes, --apply         Confirm reaping\n");
+  fprintf(stderr, "  --deep                Allow likely_orphan without map scan\n");
   fprintf(stderr, "  --verbose             Show all items (scan)\n");
   fprintf(stderr, "  --min-bytes <N>       Filter small items\n");
   fprintf(stderr,
@@ -949,6 +1194,7 @@ int main(int argc, char *argv[]) {
       .force = false,
       .yes = false,
       .verbose = false,
+      .deep = false,
       .posix_dir = "/dev/shm",
       .allow_uids = NULL,
       .allow_uids_count = 0,
@@ -966,26 +1212,77 @@ int main(int argc, char *argv[]) {
   char *cmd = argv[1];
   int start_opt = 2;
 
-  // Super basic arg parsing for now
-  for (int i = start_opt; i < argc; i++) {
-    if (strcmp(argv[i], "--sysv") == 0)
+  enum {
+    OPT_SYSV = 1,
+    OPT_POSIX,
+    OPT_JSON,
+    OPT_YES,
+    OPT_APPLY,
+    OPT_VERBOSE,
+    OPT_MIN_BYTES,
+    OPT_THRESHOLD,
+    OPT_FORCE,
+    OPT_DEEP,
+  };
+  static struct option long_opts[] = {
+      {"sysv", no_argument, NULL, OPT_SYSV},
+      {"posix", no_argument, NULL, OPT_POSIX},
+      {"json", no_argument, NULL, OPT_JSON},
+      {"yes", no_argument, NULL, OPT_YES},
+      {"apply", no_argument, NULL, OPT_APPLY},
+      {"verbose", no_argument, NULL, OPT_VERBOSE},
+      {"min-bytes", required_argument, NULL, OPT_MIN_BYTES},
+      {"threshold", required_argument, NULL, OPT_THRESHOLD},
+      {"force", no_argument, NULL, OPT_FORCE},
+      {"deep", no_argument, NULL, OPT_DEEP},
+      {0, 0, 0, 0},
+  };
+
+  opterr = 0;
+  optind = start_opt;
+  int opt;
+  while ((opt = getopt_long(argc, argv, "", long_opts, NULL)) != -1) {
+    switch (opt) {
+    case OPT_SYSV:
       cfg.target_type = TARGET_SYSV;
-    else if (strcmp(argv[i], "--posix") == 0)
+      break;
+    case OPT_POSIX:
       cfg.target_type = TARGET_POSIX;
-    else if (strcmp(argv[i], "--json") == 0)
+      break;
+    case OPT_JSON:
       cfg.json = true;
-    else if (strcmp(argv[i], "--yes") == 0)
+      break;
+    case OPT_YES:
+    case OPT_APPLY:
       cfg.yes = true;
-    else if (strcmp(argv[i], "--verbose") == 0)
+      break;
+    case OPT_VERBOSE:
       cfg.verbose = true;
-    else if (strcmp(argv[i], "--min-bytes") == 0 && i + 1 < argc)
-      cfg.min_bytes = strtoull(argv[++i], NULL, 10);
-    else if (strcmp(argv[i], "--threshold") == 0 && i + 1 < argc)
-      cfg.threshold_seconds = strtoull(argv[++i], NULL, 10);
-    // ... other args
+      break;
+    case OPT_MIN_BYTES:
+      cfg.min_bytes = strtoull(optarg, NULL, 10);
+      break;
+    case OPT_THRESHOLD:
+      cfg.threshold_seconds = strtoull(optarg, NULL, 10);
+      break;
+    case OPT_FORCE:
+      cfg.force = true;
+      break;
+    case OPT_DEEP:
+      cfg.deep = true;
+      break;
+    default:
+      fprintf(stderr, "Error: unknown option\n");
+      usage();
+      return 1;
+    }
   }
 
   if (strcmp(cmd, "scan") == 0) {
+    if (optind < argc) {
+      fprintf(stderr, "Error: unexpected argument: %s\n", argv[optind]);
+      return 1;
+    }
     if (cfg.json)
       fprintf(stdout, "[\n");
     process_items(&cfg, cfg.json ? print_json_handler : print_table_handler,
@@ -993,6 +1290,10 @@ int main(int argc, char *argv[]) {
     if (cfg.json)
       fprintf(stdout, "\n]\n");
   } else if (strcmp(cmd, "reap") == 0) {
+    if (optind < argc) {
+      fprintf(stderr, "Error: unexpected argument: %s\n", argv[optind]);
+      return 1;
+    }
     int deleted = 0;
     cfg.apply = true;
     if (cfg.json)
@@ -1001,12 +1302,12 @@ int main(int argc, char *argv[]) {
     if (cfg.json)
       fprintf(stdout, "\n]\n");
   } else if (strcmp(cmd, "explain") == 0) {
-    if (argc < 3) {
+    if (optind >= argc) {
       fprintf(stderr, "Error: explain requires an ID argument (e.g., sysv:123 "
                       "or /dev/shm/foo)\n");
       return 1;
     }
-    cfg.explain_id = argv[2]; // Simplified arg handling, assumes ID is next
+    cfg.explain_id = argv[optind];
     // Parse ID to guess target type?
     // If sysv:..., set TARGET_SYSV. If posix:..., TARGET_POSIX.
     if (strncmp(cfg.explain_id, "sysv:", 5) == 0)

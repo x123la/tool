@@ -9,6 +9,8 @@ BIN="$PROJECT_ROOT/ghostshm"
 HELPERS_DIR="$PROJECT_ROOT/tests/helpers"
 SYSV_ATTACH_SRC="$HELPERS_DIR/sysv_attach.c"
 SYSV_ATTACH_BIN="$HELPERS_DIR/sysv_attach"
+POSIX_MAP_BIN="$HELPERS_DIR/posix_map_hold"
+POSIX_OPEN_BIN="$HELPERS_DIR/posix_open_many"
 
 # Colors
 GREEN='\033[0;32m'
@@ -18,7 +20,12 @@ NC='\033[0m'
 # State
 TEST_SHMID=""
 TEST_POSIX_PATH="/dev/shm/ghostshm_test_$(date +%s)"
+TEST_POSIX_MAP_PATH="/dev/shm/ghostshm_map_$(date +%s)"
+TEST_POSIX_OPEN_PATH="/dev/shm/ghostshm_open_$(date +%s)"
+TEST_POSIX_JSON_PATH=""
 ATTACH_PID=""
+MAP_PID=""
+OPEN_PID=""
 
 cleanup() {
     echo "Cleaning up..."
@@ -26,17 +33,33 @@ cleanup() {
         kill "$ATTACH_PID" 2>/dev/null || true
         wait "$ATTACH_PID" 2>/dev/null || true
     fi
+    if [ -n "$MAP_PID" ]; then
+        kill "$MAP_PID" 2>/dev/null || true
+        wait "$MAP_PID" 2>/dev/null || true
+    fi
+    if [ -n "$OPEN_PID" ]; then
+        kill "$OPEN_PID" 2>/dev/null || true
+        wait "$OPEN_PID" 2>/dev/null || true
+    fi
     if [ -n "$TEST_SHMID" ]; then
         ipcrm -m "$TEST_SHMID" 2>/dev/null || true
     fi
     rm -f "$TEST_POSIX_PATH"
+    rm -f "$TEST_POSIX_MAP_PATH"
+    rm -f "$TEST_POSIX_OPEN_PATH"
+    if [ -n "$TEST_POSIX_JSON_PATH" ]; then
+        rm -f "$TEST_POSIX_JSON_PATH"
+    fi
     rm -f "$SYSV_ATTACH_BIN"
+    rm -f "$POSIX_MAP_BIN" "$POSIX_OPEN_BIN"
 }
 
 trap cleanup EXIT
 
 echo "--- Building prerequisites ---"
 cc "$SYSV_ATTACH_SRC" -o "$SYSV_ATTACH_BIN"
+cc "$HELPERS_DIR/posix_map_hold.c" -o "$POSIX_MAP_BIN"
+cc "$HELPERS_DIR/posix_open_many.c" -o "$POSIX_OPEN_BIN"
 echo "Rebuilding ghostshm..."
 make
 
@@ -49,6 +72,28 @@ echo "Created SysV shmid: $TEST_SHMID"
 # 2. Create a POSIX segment (likely orphan after delay)
 truncate -s 128000 "$TEST_POSIX_PATH"
 echo "Created POSIX shm: $TEST_POSIX_PATH"
+
+# 3. Create a POSIX segment with mmap usage but no open fd
+truncate -s 4096 "$TEST_POSIX_MAP_PATH"
+chmod 600 "$TEST_POSIX_MAP_PATH"
+echo "Created POSIX mmap shm: $TEST_POSIX_MAP_PATH"
+"$POSIX_MAP_BIN" "$TEST_POSIX_MAP_PATH" 4096 30 > /dev/null &
+MAP_PID=$!
+sleep 1
+
+# 4. Create a POSIX segment with many open handles
+truncate -s 4096 "$TEST_POSIX_OPEN_PATH"
+chmod 600 "$TEST_POSIX_OPEN_PATH"
+echo "Created POSIX open-handles shm: $TEST_POSIX_OPEN_PATH"
+"$POSIX_OPEN_BIN" "$TEST_POSIX_OPEN_PATH" 40 30 > /dev/null &
+OPEN_PID=$!
+sleep 1
+
+# 5. Create a POSIX segment with JSON-escape characters in name
+JSON_NAME=$'ghostshm_json_"quote"_\\backslash'
+TEST_POSIX_JSON_PATH="/dev/shm/$JSON_NAME"
+touch "$TEST_POSIX_JSON_PATH"
+echo "Created POSIX json shm: $TEST_POSIX_JSON_PATH"
 
 echo "--- Testing: scan ---"
 $BIN scan --threshold 0s || [ $? -le 2 ]
@@ -89,6 +134,36 @@ sleep 1 # Wait for detachment
 echo "--- Testing: reap (dry-run) ---"
 $BIN reap --sysv --threshold 0s --json | grep "\"id\": $TEST_SHMID"
 echo -e "${GREEN}Reap Dry-Run OK${NC}"
+
+echo "--- Testing: POSIX mapping detection ---"
+OUT=$($BIN scan --posix --json --threshold 0s)
+if echo "$OUT" | grep -F "\"path\": \"$TEST_POSIX_MAP_PATH\"" | grep -q "\"class\": \"in_use\""; then
+     echo -e "${GREEN}POSIX Mapping Detection OK${NC}"
+else
+     echo -e "${RED}POSIX Mapping Detection FAILED${NC}"
+     echo "$OUT" | grep -F "\"path\": \"$TEST_POSIX_MAP_PATH\""
+     exit 1
+fi
+
+echo "--- Testing: POSIX open handles overflow safety ---"
+OUT=$($BIN explain "$TEST_POSIX_OPEN_PATH")
+if echo "$OUT" | grep -q "Open Handles:40"; then
+     echo -e "${GREEN}POSIX Open Handles OK${NC}"
+else
+     echo -e "${RED}POSIX Open Handles FAILED${NC}"
+     echo "$OUT"
+     exit 1
+fi
+
+echo "--- Testing: JSON escaping ---"
+OUT=$($BIN scan --posix --json --threshold 0s)
+if echo "$OUT" | grep -F "\\\"quote\\\"" | grep -Fq "\\\\backslash"; then
+     echo -e "${GREEN}JSON Escape OK${NC}"
+else
+     echo -e "${RED}JSON Escape FAILED${NC}"
+     echo "$OUT" | grep -F "\"path\":"
+     exit 1
+fi
 
 echo "--- Testing: reap --apply ---"
 # Reap the specific POSIX test file and SysV segment
