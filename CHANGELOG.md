@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Improvements
+- Added POSIX mapping detection to reduce false-orphan classification.
+- Added SysV fallback enumeration via shmctl when `/proc/sysvipc/shm` is missing.
+- Added strict CLI parsing with `--apply` alias and safer JSON escaping.
+- Added install targets and expanded integration tests.
+
 ## [0.2.0] - 2026-01-04
 
 ### Migrated to C11

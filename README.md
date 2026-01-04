@@ -1,56 +1,34 @@
 # ghostshm
 
-ghostshm is a high-performance Linux CLI utility for detecting and safely reaping orphaned shared memory segments. It scans both System V non-file-backed shared memory (`/proc/sysvipc/shm`) and POSIX shared memory objects (files in `/dev/shm`), identifying segments that likely have no attached processes and are remnants of crashed or defunct applications.
+ghostshm is a Linux CLI for detecting and safely reaping orphaned shared memory
+segments. It scans both System V shared memory and POSIX shared memory objects
+under `/dev/shm`, then classifies each item with a conservative safety model.
 
-Migrated from Zig to C11, `ghostshm` is now a single-binary utility with zero dependencies, designed for maximum reliability and minimal footprint.
+## Features
+
+- SysV and POSIX scanning with JSON output.
+- Dry-run by default with TOCTOU revalidation on reap.
+- PID reuse detection and conservative handling when `/proc` is partial.
+- POSIX mapping detection to avoid false-orphan classification.
 
 ## Safety Model
 
-Safety is a primary design goal. `ghostshm` follows a conservative approach:
-- **Dry-run by default**: Commands never delete data unless `--yes` (alias: `--apply`) is explicitly provided.
-- **Verification**: Before any deletion, the tool re-validates the segment state (e.g., using `shmctl(IPC_STAT)` or `stat()`) to ensure no process attached between the scan and the reap.
-- **Conservative Classification**: If the tool cannot fully scan `/proc` (e.g., due to permissions), it marks ambiguous items as `unknown`.
-- **Private File Override**: For POSIX shared memory, if the user owns the file and it has private permissions (`0600`), the tool allows reaping even if `/proc` visibility is partial.
-- **PID Reuse Protection**: Compares segment creation time against PID start times to avoid misidentifying recycled PIDs.
+ghostshm prefers "unknown" over false positives:
+- If `/proc` visibility is partial, ambiguous items are marked `unknown`.
+- If POSIX mapping detection is unavailable, items are marked `unknown` unless
+  `--deep` is set.
+- Reap always re-checks the segment just before deletion.
 
-## Usage
+## Requirements
 
-```bash
-# Scan for orphans (default view)
-./ghostshm scan
-
-# Scan and output JSON
-./ghostshm scan --json
-
-# Explain classification for a specific ID
-./ghostshm explain sysv:12345
-./ghostshm explain /dev/shm/my_shm
-
-# Reap orphans (actual deletion)
-./ghostshm reap --yes
-./ghostshm reap --apply
-```
-
-### Common Flags
-- `--threshold <seconds>`: Minimum age of segment in seconds. Default: `60`.
-- `--min-bytes <n>`: Ignore segments smaller than this.
-- `--json`: Output valid JSON for machine processing.
-- `--verbose`: Show all segments, including those classified as unknown.
-- `--deep`: Allow POSIX `likely_orphan` without a successful mapping scan.
-
-## Build Instructions
-
-Requires a standard C compiler (GCC or Clang).
-
-```bash
-make
-```
-
-The resulting binary `ghostshm` is statically linked by default (on Linux).
+- Linux with `/proc` mounted.
+- Access to `/proc/<pid>` entries improves accuracy.
 
 ## Install
 
 ```bash
+make
+
 # System-wide (may need sudo)
 make install
 
@@ -64,5 +42,33 @@ Ensure `$HOME/.local/bin` is in your `PATH` to run:
 ghostshm scan
 ```
 
+## Usage
+
+```bash
+ghostshm scan
+ghostshm scan --json
+ghostshm explain sysv:12345
+ghostshm explain /dev/shm/my_shm
+ghostshm reap --yes
+ghostshm reap --apply --threshold 3600
+```
+
+Common flags:
+- `--sysv`, `--posix`: Target specific subsystem (default: both).
+- `--threshold <seconds>`: Minimum age of segment in seconds. Default: `60`.
+- `--min-bytes <n>`: Ignore segments smaller than this.
+- `--json`: Output valid JSON for machine processing.
+- `--verbose`: Show all segments, including `unknown`.
+- `--yes` / `--apply`: Confirm reaping (no deletes without this).
+- `--force`: Allow reaping `possible_orphan` and `risky_to_remove`.
+- `--deep`: Allow POSIX `likely_orphan` without a successful mapping scan.
+
+## Docs
+
+- Development notes: `docs/DEVELOPMENT.md`
+- Security reporting: `docs/SECURITY.md`
+- Contributing guide: `CONTRIBUTING.md`
+
 ## License
-MIT
+
+MIT. See `LICENSE`.
